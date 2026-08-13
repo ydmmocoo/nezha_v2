@@ -212,11 +212,9 @@ tls: false
 
 ```caddyfile
 reverse_proxy /proto.NezhaService/* localhost:8008 {
-    transport http { versions h2c 2 }
+    transport http { versions h2c }
 }
-reverse_proxy localhost:8008 {
-    transport http { versions h1 }
-}
+reverse_proxy localhost:8008
 ```
 
 > 附带提醒：SPA 会从 `fastly.jsdelivr.net` 加载图标/字体 CSS，国内网络常被墙会变慢或加载不全（仅影响样式，不影响数据）。如需彻底离线可把 `index.html` 里的 cdn 引用改为自托管。
@@ -230,6 +228,22 @@ reverse_proxy localhost:8008 {
 修复：gRPC 路径用 `transport http { versions h2c }`；其余 Web/REST/WebSocket 走默认 HTTP/1.1（**直接写 `reverse_proxy localhost:8008`，不要加 transport 块**，默认即 1.1，原生支持 WebSocket Upgrade）。本镜像 `entrypoint.sh` 已用此写法并通过 `caddy validate` 校验（`Valid configuration`）。
 
 > 顺带：首版曾写成 `versions h2c 2`（`h2c` 与 `2` 都合法，故能跑）；切勿画蛇添足改成 `h1`。
+
+**修改密码提示「意外错误」（`POST /api/v1/profile` 返回 200 但改密失败）**
+
+根因：哪吒 V2 的改密码接口 `updateProfile` **永远要求先校验「原密码」**（`bcrypt.CompareHashAndPassword(user.Password, 原密码)`）。当账号是**纯 GitHub OAuth 登录**创建时，账号没有本地密码（`user.Password` 为空），任何「原密码」都无法匹配 → 后端返回 `"incorrect password"`。该错误走 HTTP 200 + JSON body，前端统一弹「意外错误」。这不是网络/容器问题（日志里所有 `/api/v1/*` 都是 200、WebSocket 也正常）。
+
+✅ 正解（无需改代码，立即可用）：容器首次启动、用户表为空时，哪吒会**自动创建一个本地管理员 `admin` / `admin`**（密码即字符串 `admin` 的 bcrypt 哈希）。这个账号与你的 GitHub OAuth 账号**相互独立、且自带本地密码**。请这样操作：
+
+1. 在登录页用**账号密码**方式登录（用户名 `admin`，密码 `admin`）；
+2. 进入「个人中心 / 修改密码」，原密码填 `admin`，设置新密码 → 即可成功；
+3. 之后用新密码或 GitHub OAuth 都能登录 `admin` 这个管理员账号。
+
+⚠️ 为什么不能直接给 GitHub 账号改密码：OAuth 账号在 nezha 里设计上就没有本地密码字段，`updateProfile` 又强制校验原密码，因此 Web 表单无法为它设置密码。这是正常现象——直接用上面那个本地 `admin` 账号做密码登录即可，GitHub OAuth 仅作为另一种登录方式。
+
+> 若想要一个“自定义用户名 + 密码”的本地管理员：登录 `admin` 后进入「系统设置 → 用户管理」**新建**一个带密码的本地管理员账号即可（注意是“新建”，不是“编辑自己”——编辑自己仍走原密码校验）。
+
+> 注：本镜像每次重建容器会因 `jwt_secret_key` 重新生成而使旧登录会话失效（日志 `generated new jwt_secret_key`）。已部署后建议通过 GitHub 私库备份 `/dashboard/data`（`GH_PAT`+`GH_REPO`+`GH_EMAIL`）以便恢复；或在环境变量注入固定 `NZ_JWTSECRETKEY` 避免每次轮换。
 
 ---
 

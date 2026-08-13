@@ -227,6 +227,8 @@ EOF
     echo "startsecs=10"
     echo "stderr_logfile=/dev/stderr"
     echo "stdout_logfile=/dev/stdout"
+    echo "stderr_logfile_maxbytes=0"
+    echo "stdout_logfile_maxbytes=0"
     echo ""
     echo "[program:nezha]"
     echo "command=$WORK_DIR/app"
@@ -236,6 +238,8 @@ EOF
     echo "startsecs=10"
     echo "stderr_logfile=/dev/stderr"
     echo "stdout_logfile=/dev/stdout"
+    echo "stderr_logfile_maxbytes=0"
+    echo "stdout_logfile_maxbytes=0"
     echo "environment=OAUTH2_TYPE=\"github\",OAUTH2_ADMIN=\"$GH_USER\",OAUTH2_CLIENTID=\"$GH_CLIENTID\",OAUTH2_CLIENTSECRET=\"$GH_CLIENTSECRET\",OAUTH2_ENDPOINT=\"\""
     echo ""
     if [ "$BUILTIN_AGENT" = "1" ]; then
