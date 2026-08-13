@@ -202,6 +202,25 @@ tls: false
 - **OAuth（GitHub 登录）不是写在 config.yaml 里**，而是由容器通过 `OAUTH2_*` 环境变量注入（`OAUTH2_TYPE` / `OAUTH2_ADMIN` / `OAUTH2_CLIENTID` / `OAUTH2_CLIENTSECRET` / `OAUTH2_ENDPOINT`），值来自你填的 `GH_*` 变量。
 - 若仍异常，进容器看面板真实报错：`docker exec -it <容器> tail -f /dashboard/data/../*.log` 或检查 supervisor 中 `nezha` 的 stdout（本镜像已将其输出到容器 stdout，部署平台日志即可见）。
 
+**页面能打开，但提示「后端 API 无法访问 / 无法加载监控数据」，控制台报 `Unexpected token '<', "<!DOCTYPE>"... is not valid JSON`**
+
+根因：哪吒 V2 的**实时监控数据走 WebSocket**（`/api/v1/ws/server`）。若反代把 WebSocket 升级请求用 `h2c`（HTTP/2 明文）传输转发，Cloudflare/Argo 回源会得到 **502**，前端拿不到数据并连锁命中 Cloudflare 的 HTML 错误页，被当成 JSON 解析。
+
+验证：`curl -i -H "Connection: Upgrade" -H "Upgrade: websocket" https://<你的域名>/api/v1/ws/server` 若返回 `502 Bad Gateway` 即为此问题。
+
+修复：反代必须**按路径分流**——仅 gRPC 路径 `/proto.NezhaService/*` 用 `h2c`（HTTP/2），Web/REST API/WebSocket 一律走 **HTTP/1.1**（支持 Upgrade）。本镜像 `entrypoint.sh` 已默认如此生成 Caddyfile；若你曾手改过 Caddyfile，请确认包含：
+
+```caddyfile
+reverse_proxy /proto.NezhaService/* localhost:8008 {
+    transport http { versions h2c 2 }
+}
+reverse_proxy localhost:8008 {
+    transport http { versions h1 }
+}
+```
+
+> 附带提醒：SPA 会从 `fastly.jsdelivr.net` 加载图标/字体 CSS，国内网络常被墙会变慢或加载不全（仅影响样式，不影响数据）。如需彻底离线可把 `index.html` 里的 cdn 引用改为自托管。
+
 ---
 
 ## 与参考项目的差异（为何是 V2-only）
