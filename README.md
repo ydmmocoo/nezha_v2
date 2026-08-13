@@ -221,6 +221,16 @@ reverse_proxy localhost:8008 {
 
 > 附带提醒：SPA 会从 `fastly.jsdelivr.net` 加载图标/字体 CSS，国内网络常被墙会变慢或加载不全（仅影响样式，不影响数据）。如需彻底离线可把 `index.html` 里的 cdn 引用改为自托管。
 
+**Caddy 反复 `exit status 1`、`gave up: caddy entered FATAL state`（nezha 进程却正常）**
+
+根因：Caddy `reverse_proxy` 的 `transport http` 里 **`versions` 合法值只有 `1.1` / `2` / `h2c` / `3`，没有 `h1`**。若误写成 `versions h1`，Caddy 在 provision 阶段直接报 `unsupported HTTP version: h1` 并 `exit 1`；而面板进程本身没问题，所以日志里只有 caddy 在死循环重启。
+
+> 注意 supervisor 里 `caddy` 的 stdout/stderr 默认指向 `/dev/null`，真实报错被吞。本镜像已改为输出到容器 stdout，部署平台日志即可看到 `unsupported HTTP version` 之类的具体错误。
+
+修复：gRPC 路径用 `transport http { versions h2c }`；其余 Web/REST/WebSocket 走默认 HTTP/1.1（**直接写 `reverse_proxy localhost:8008`，不要加 transport 块**，默认即 1.1，原生支持 WebSocket Upgrade）。本镜像 `entrypoint.sh` 已用此写法并通过 `caddy validate` 校验（`Valid configuration`）。
+
+> 顺带：首版曾写成 `versions h2c 2`（`h2c` 与 `2` 都合法，故能跑）；切勿画蛇添足改成 `h1`。
+
 ---
 
 ## 与参考项目的差异（为何是 V2-only）

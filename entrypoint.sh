@@ -122,11 +122,11 @@ EOF
   openssl req -new -subj "/CN=$ARGO_DOMAIN" -key "$WORK_DIR/nezha.key" -out "$WORK_DIR/nezha.csr" 2>/dev/null
   openssl x509 -req -days 36500 -in "$WORK_DIR/nezha.csr" -signkey "$WORK_DIR/nezha.key" -out "$WORK_DIR/nezha.pem" 2>/dev/null
 
-  # ---- 7. 生成 Caddyfile（V2：gRPC 走 h2c，Web/API/WebSocket 走 HTTP/1.1）----
-  # 关键点：WebSocket（前端实时监控数据 /api/v1/ws/server）依赖 HTTP/1.1 Upgrade，
-  # 不能走 h2c（HTTP/2 明文）传输，否则 Cloudflare/Argo 回源会 502，
-  # 表现为“页面正常但无法加载监控数据 / 后端 API 无法访问”。
-  # 因此仅 gRPC 路径 /proto.NezhaService/* 用 h2c，其余统一走 HTTP/1.1。
+  # ---- 7. 生成 Caddyfile（V2：gRPC 走 h2c，Web/API/WebSocket 走默认 HTTP/1.1）----
+  # 关键点：
+  #  - gRPC 路径 /proto.NezhaService/* 必须 HTTP/2 明文（h2c），故显式 transport http { versions h2c }
+  #  - Web / REST API / WebSocket 走默认 HTTP/1.1（原生支持 Upgrade），无需 transport 块
+  #  - Caddy 合法版本标记只有 1.1 / 2 / h2c / 3，切勿写 h1（会 provision 失败 → caddy exit 1）
   cat > "$WORK_DIR/Caddyfile" << EOF
 {
     http_port $CADDY_HTTP_PORT
@@ -134,18 +134,14 @@ EOF
 }
 
 :$GRPC_PROXY_PORT {
-    # gRPC：必须 HTTP/2（h2c 明文）
+    # gRPC：HTTP/2 明文（h2c）
     reverse_proxy /proto.NezhaService/* localhost:$GRPC_PORT {
         transport http {
-            versions h2c 2
+            versions h2c
         }
     }
-    # Web / REST API / WebSocket：HTTP/1.1，支持 Upgrade
-    reverse_proxy localhost:$GRPC_PORT {
-        transport http {
-            versions h1
-        }
-    }
+    # Web / REST API / WebSocket：默认 HTTP/1.1（支持 Upgrade）
+    reverse_proxy localhost:$GRPC_PORT
     tls $WORK_DIR/nezha.pem $WORK_DIR/nezha.key
 }
 EOF
@@ -228,8 +224,9 @@ EOF
     echo "command=$WORK_DIR/caddy run --config $WORK_DIR/Caddyfile"
     echo "autostart=true"
     echo "autorestart=true"
-    echo "stderr_logfile=/dev/null"
-    echo "stdout_logfile=/dev/null"
+    echo "startsecs=10"
+    echo "stderr_logfile=/dev/stderr"
+    echo "stdout_logfile=/dev/stdout"
     echo ""
     echo "[program:nezha]"
     echo "command=$WORK_DIR/app"
