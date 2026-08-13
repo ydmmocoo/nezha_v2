@@ -146,8 +146,13 @@ docker compose up -d
 
 ### 3. PaaS（Northflank / dashboard.suga.app / Render / Koyeb）
 
-- 源码仓库连接本仓库，构建命令 `docker build -t nezha-v2 .`，运行命令即容器入口（`entrypoint.sh` 自动执行）。
+> **不要**在「Deploy from image」里直接填 `nezha-v2-argo:latest` —— 这只是本地/未推送的镜像标签，PaaS 拉不到会报“无法获取”。必须二选一：
+> - **A. 从源码构建（推荐）**：选「Build from a Git Repository」，连接本 GitHub 仓库，Build Method 选 Dockerfile（路径 `/Dockerfile`）。Northflank 自动 build 并托管镜像，无需手动 push。
+> - **B. 推送到 registry**：先把镜像 push 到 Docker Hub / GHCR / 平台自带 registry，再填**完整地址**（如 `docker.io/<用户名>/nezha-v2-argo:latest` 或 `ghcr.io/<用户名>/nezha-v2-argo:latest`）。`.github/workflows/Build.yml` 会在 push 到 main 时自动构建推送（需配 `DOCKERHUB_*` 或 `GHCR_TOKEN` secrets）。
+
 - 在平台的环境变量面板填入上述 `GH_*` / `ARGO_*` 必填项。
+- **Build arguments 留空**（Dockerfile 无任何 `ARG`，所有配置都在运行时通过 Runtime variables 注入，不在 build 阶段）。
+- **Runtime variables** 填法见上方「环境变量」表：`GH_USER` / `GH_CLIENTID` / `GH_CLIENTSECRET` / `ARGO_AUTH` / `ARGO_DOMAIN` 为必填；`GH_CLIENTSECRET` / `ARGO_AUTH` / `GH_PAT` / `NZ_AGENTKEY` 建议标为 Secret。`ARCH` / `CADDY_VER` / `DASH_VER_TAG` 为脚本内部自动计算，切勿手动填。
 - **务必配置 `GH_PAT` + `GH_REPO` + `GH_EMAIL` 备份**：PaaS 文件系统是临时性的，重启会丢失 `/dashboard/data`，靠 GitHub 备份恢复。
 - 平台一般无需映射端口（Argo 隧道出站 443 即可）。
 
@@ -176,6 +181,26 @@ env NZ_SERVER=example.com:443 NZ_TLS=true NZ_CLIENT_SECRET=<密钥> NZ_UUID=<uui
 - 手动备份：`bash /dashboard/backup.sh`
 - 手动还原：`bash /dashboard/restore.sh`（还原最新）或 `bash /dashboard/restore.sh dashboard-xxxx.tar.gz`
 - 手动更新面板：`bash /dashboard/renew.sh`
+
+---
+
+## 排错
+
+**`nezha` 进程反复 `exit status 1`、supervisor 报 `too many start retries`**
+几乎都是 `data/config.yaml` 不符合 V2 schema 导致。V2 面板**只认以下 6 个字段**（全小写）：
+
+```yaml
+debug: false
+listen_port: 8008
+language: zh-CN
+site_name: "Nezha Probe"
+install_host: <你的ARGO域名>
+tls: false
+```
+
+- 切勿使用 V0/V1 的 `HTTPPort` / `GRPCPort` / `Oauth2` / `site` 字段——V2 不识别，且 `listen_port` 缺省为 `0`，面板绑定端口 0 失败直接退出。
+- **OAuth（GitHub 登录）不是写在 config.yaml 里**，而是由容器通过 `OAUTH2_*` 环境变量注入（`OAUTH2_TYPE` / `OAUTH2_ADMIN` / `OAUTH2_CLIENTID` / `OAUTH2_CLIENTSECRET` / `OAUTH2_ENDPOINT`），值来自你填的 `GH_*` 变量。
+- 若仍异常，进容器看面板真实报错：`docker exec -it <容器> tail -f /dashboard/data/../*.log` 或检查 supervisor 中 `nezha` 的 stdout（本镜像已将其输出到容器 stdout，部署平台日志即可见）。
 
 ---
 

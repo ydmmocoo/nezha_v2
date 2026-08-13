@@ -108,23 +108,12 @@ if [ ! -s "$DAEMON_CONF" ]; then
   [ ! -d "$WORK_DIR/data" ] && mkdir -p "$WORK_DIR/data"
   LANG_VAL=${LANGUAGE:-zh-CN}
   cat > "$WORK_DIR/data/config.yaml" << EOF
-Debug: false
-HTTPPort: $WEB_PORT
-Language: $LANG_VAL
-GRPCPort: $GRPC_PORT
-GRPCHost: $ARGO_DOMAIN
-ProxyGRPCPort: $GRPC_PROXY_PORT
-TLS: false
-Oauth2:
-  Type: "github"
-  Admin: "$GH_USER"
-  ClientID: "$GH_CLIENTID"
-  ClientSecret: "$GH_CLIENTSECRET"
-  Endpoint: ""
-site:
-  Brand: "Nezha Probe"
-  Cookiename: "nezha-dashboard"
-  Theme: "default"
+debug: false
+listen_port: $WEB_PORT
+language: $LANG_VAL
+site_name: "Nezha Probe"
+install_host: $ARGO_DOMAIN
+tls: false
 EOF
   info "已生成 data/config.yaml"
 
@@ -236,8 +225,10 @@ EOF
     echo "directory=$WORK_DIR"
     echo "autostart=true"
     echo "autorestart=true"
-    echo "stderr_logfile=/dev/null"
-    echo "stdout_logfile=/dev/null"
+    echo "startsecs=10"
+    echo "stderr_logfile=/dev/stderr"
+    echo "stdout_logfile=/dev/stdout"
+    echo "environment=OAUTH2_TYPE=\"github\",OAUTH2_ADMIN=\"$GH_USER\",OAUTH2_CLIENTID=\"$GH_CLIENTID\",OAUTH2_CLIENTSECRET=\"$GH_CLIENTSECRET\",OAUTH2_ENDPOINT=\"\""
     echo ""
     if [ "$BUILTIN_AGENT" = "1" ]; then
       echo "[program:agent]"
