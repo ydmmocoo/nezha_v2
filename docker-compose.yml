@@ -1,0 +1,38 @@
+# 本地 / VPS 部署示例（哪吒面板 V2 + Argo 隧道）
+# 用法：
+#   docker compose up -d
+# 或指定版本/备份：
+#   DASHBOARD_VERSION=v2.3.4 GH_PAT=xxx GH_REPO=nezha-backup docker compose up -d
+services:
+  nezha-v2:
+    build: .
+    image: nezha-v2-argo:latest
+    container_name: nezha_v2
+    restart: always
+    environment:
+      - GH_USER=${GH_USER}
+      - GH_CLIENTID=${GH_CLIENTID}
+      - GH_CLIENTSECRET=${GH_CLIENTSECRET}
+      - ARGO_AUTH=${ARGO_AUTH}
+      - ARGO_DOMAIN=${ARGO_DOMAIN}
+      # 可选：固定面板版本（V2 格式，如 v2.3.4）；留空=最新
+      - DASHBOARD_VERSION=${DASHBOARD_VERSION:-}
+      # 可选：后台语言
+      - LANGUAGE=${LANGUAGE:-zh-CN}
+      # 可选：GitHub 备份（强烈建议，PaaS 文件系统易失）
+      - GH_PAT=${GH_PAT:-}
+      - GH_EMAIL=${GH_EMAIL:-}
+      - GH_REPO=${GH_REPO:-}
+      - GH_BACKUP_USER=${GH_BACKUP_USER:-}
+      # 可选：内置本机探针（需先在面板获取管理员 agent secret）
+      - NZ_agentsecretkey=${NZ_agentsecretkey:-}
+      - IDU=${IDU:-}
+      - NZ_DOMAIN=${NZ_DOMAIN:-}
+      # 可选：关闭每日自动更新/备份同步
+      - NO_AUTO_RENEW=${NO_AUTO_RENEW:-}
+    # 持久化数据（可选但推荐）
+    volumes:
+      - ./data:/dashboard/data
+    # Argo 隧道本身走 443 出站，无需映射端口；如需本地调试可临时开放
+    # ports:
+    #   - "127.0.0.1:8008:8008"
