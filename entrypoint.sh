@@ -91,7 +91,7 @@ if [ ! -s "$DAEMON_CONF" ]; then
   rm -rf /tmp/dashboard.zip /tmp/dist
 
   # ---- 4. 可选：下载内置本机探针 Agent（nezhahq/agent）----
-  if [[ -n "${NZ_agentsecretkey:-}" && -n "${IDU:-}" && -n "${NZ_DOMAIN:-}" ]]; then
+  if [[ -n "${NZ_AGENTKEY:-}" && -n "${IDU:-}" && -n "${NZ_DOMAIN:-}" ]]; then
     info "下载哪吒 Agent（内置探针）..."
     gh_download "$WORK_DIR/nezha-agent.zip" "https://github.com/nezhahq/agent/releases/latest/download/nezha-agent_linux_${ARCH}.zip" \
       || error "Agent 下载失败"
@@ -101,7 +101,7 @@ if [ ! -s "$DAEMON_CONF" ]; then
     BUILTIN_AGENT=1
   else
     BUILTIN_AGENT=0
-    hint "未设置 NZ_agentsecretkey / IDU / NZ_DOMAIN，跳过内置探针；可在面板后台“服务器-安装命令”添加被控端。"
+    hint "未设置 NZ_AGENTKEY / IDU / NZ_DOMAIN，跳过内置探针；可在面板后台“服务器-安装命令”添加被控端。"
   fi
 
   # ---- 5. 生成 V2 配置文件 data/config.yaml ----
@@ -181,7 +181,7 @@ EOF
   # ---- 9. 可选：内置探针 Agent 配置 ----
   if [ "$BUILTIN_AGENT" = "1" ]; then
     cat > "$WORK_DIR/agent.yml" << EOF
-client_secret: $NZ_agentsecretkey
+client_secret: $NZ_AGENTKEY
 debug: false
 disable_auto_update: true
 disable_command_execute: false

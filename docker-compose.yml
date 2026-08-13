@@ -25,7 +25,7 @@ services:
       - GH_REPO=${GH_REPO:-}
       - GH_BACKUP_USER=${GH_BACKUP_USER:-}
       # 可选：内置本机探针（需先在面板获取管理员 agent secret）
-      - NZ_agentsecretkey=${NZ_agentsecretkey:-}
+      - NZ_AGENTKEY=${NZ_AGENTKEY:-}
       - IDU=${IDU:-}
       - NZ_DOMAIN=${NZ_DOMAIN:-}
       # 可选：关闭每日自动更新/备份同步

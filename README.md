@@ -68,10 +68,54 @@ V2 的 Web、gRPC、WebSocket 都由 Dashboard 在 **8008** 一个端口处理�
 | `LANGUAGE` | 否 | `zh-CN` | 后台语言 |
 | `GH_PAT` / `GH_EMAIL` / `GH_REPO` | 否 | — | GitHub 备份库（私库），三者齐备才启用每日备份 |
 | `GH_BACKUP_USER` | 否 | `=$GH_USER` | 备份库所属 GitHub 用户 |
-| `NZ_agentsecretkey` / `IDU` / `NZ_DOMAIN` | 否 | — | 三者齐备才启用**内置本机探针** |
+| `NZ_AGENTKEY` / `IDU` / `NZ_DOMAIN` | 否 | — | 三者齐备才启用**内置本机探针** |
 | `NO_AUTO_RENEW` | 否 | 未设置 | 设置任意值即关闭每日自动更新/备份同步 |
 
-**内置探针说明**：`NZ_agentsecretkey` 是面板管理员账户的 Agent 密钥（登录面板后「个人中心 / 服务器安装命令」可获取），`IDU` 用 `uuidgen` 生成一个唯一 ID，`NZ_DOMAIN` 填 `127.0.0.1:8008`（本机直连，tls=false）或公网域名（如 `example.com:443`，tls=true）。三者缺一则不启动内置探针——此时可在面板「服务器 → 安装命令」添加任意被控端（V2 官方推荐方式）。
+**内置探针说明**：`NZ_AGENTKEY` 是面板管理员账户的 Agent 密钥（登录面板后「个人中心 / 服务器安装命令」可获取），`IDU` 用 `uuidgen` 生成一个唯一 ID，`NZ_DOMAIN` 填 `127.0.0.1:8008`（本机直连，tls=false）或公网域名（如 `example.com:443`，tls=true）。三者缺一则不启动内置探针——此时可在面板「服务器 → 安装命令」添加任意被控端（V2 官方推荐方式）。
+
+---
+
+## Docker 镜像
+
+### 构建镜像
+
+```bash
+# 在仓库根目录执行
+docker build -t nezha-v2-argo:latest .
+```
+
+镜像名约定为 `nezha-v2-argo:latest`，内部包含 Debian + supervisor 守护进程、Caddy 反代、以及 `entrypoint.sh` 初始化逻辑。**镜像本身不含面板二进制**——V2 Dashboard（与可选 Agent）在容器首次启动时按需从 GitHub 下载，所以构建很快、体积很小，但运行时需能访问 `github.com`。
+
+### 多架构构建（CI 自动）
+
+`.github/workflows/Build.yml` 借助 `docker/setup-qemu-action` + `docker/setup-buildx-action`，在 push 到 `main` 时自动构建并推送 `linux/amd64` 与 `linux/arm64` 双架构镜像到容器 registry（GHCR / Docker Hub）。在 GitHub 仓库 `Settings → Secrets` 配置 `DOCKERHUB_USERNAME` / `DOCKERHUB_TOKEN`（或 `GHCR_TOKEN`）后启用。
+
+```bash
+# 本地模拟多架构构建（需 buildx + qemu）
+docker buildx build --platform linux/amd64,linux/arm64 -t nezha-v2-argo:latest . --load
+```
+
+### 推送到镜像仓库
+
+```bash
+# Docker Hub
+docker tag nezha-v2-argo:latest <用户名>/nezha-v2-argo:latest
+docker push <用户名>/nezha-v2-argo:latest
+
+# 或 GHCR
+docker tag nezha-v2-argo:latest ghcr.io/<用户名>/nezha-v2-argo:latest
+docker push ghcr.io/<用户名>/nezha-v2-argo:latest
+```
+
+> 标签约定：`latest` 跟随仓库 `main`；如需固定版本可额外打 `vX.Y.Z` 标签。该标签**只标识容器镜像**，与 `DASHBOARD_VERSION`（控制面板版本）解耦。
+
+### 直接拉取运行
+
+构建并推送后，后续部署可跳过构建步骤，直接 `docker pull` 再 `docker run`（见下方「部署 → Docker Run」）：
+
+```bash
+docker pull <用户名>/nezha-v2-argo:latest
+```
 
 ---
 
