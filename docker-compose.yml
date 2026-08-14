@@ -1,5 +1,3 @@
-# 本地测试用。生产部署见 README.md（Northflank 章节）。
-# 仅兼容哪吒面板 V2（nezhahq/nezha），不兼容 V1 / legacy v0。
 services:
   nezha-v2:
     build: .
@@ -10,33 +8,8 @@ services:
     volumes:
       - ./data:/app/data
     environment:
-      # 必填：agent 与 dashboard 通信密钥（请改成一段足够长的随机字符串）
-      # 该值会写入 config.yaml 的 agent_secret_key（V2 注册为 user 0），
-      # 同时作为自监控 agent 的 client_secret——二者必须一致，否则探针不显示。
-      NZ_AGENTKEY: "change-me-to-a-long-random-secret-string"
-      # 可选：是否强制登录。true=需要登录（更安全，推荐）；false=允许访客看公开状态页
       FORCE_AUTH: "true"
-
-      # ---- 可选功能（按需取消注释）----
-      # 生产推荐：JWT 签名密钥，避免 V2.0.13+ 自动轮转导致频繁登出
-      # NZ_JWTSECRETKEY: "change-me-to-another-long-random-string"
-      # 反代/公网域名（OAuth2 回调 Host、NAT 保留域名）；Northflank 等反代建议设置
-      # NZ_DASHBOARD_HOST: "your-app.northflank.app"
-      # Cloudflare Tunnel（token 模式），不填则不启动 cloudflared
-      # ARGO_AUTH: "eyJhIjoi..."
-      # 面板/agent 上报域名（与 IDU 同时填写才会安装自监控 agent）
-      # NZ_DOMAIN: "nezha.example.com"
-      # IDU: "你的-agent-uuid"
-      # 固定版本（不填则自动跟踪 v2 最新版）
+      NZ_JWTSECRETKEY: "replace-with-a-long-random-secret"
+      # Optional: pin the current V2 releases for reproducible deployments.
       # DASHBOARD_VERSION: "v2.3.4"
-      # AGENT_VERSION: "v2.3.3"
-      # 自定义用户主题 zip
-      # NZ_EXTRA_USER_THEME: "https://github.com/fl0w1nd/Lotus/releases/latest/download/dist.zip"
-      # TSDB 历史指标
-      # NZ_ENABLE_TSDB: "true"
-      # NZ_TSDB_RETENTION_DAYS: "7"
-      # GitHub 备份/恢复（四个都填才启用）
-      # GITHUB_USERNAME: "YOUR_GH_USER"
-      # REPO_NAME: "YOUR_BACKUP_REPO"
-      # GITHUB_TOKEN: "YOUR_GH_TOKEN"
-      # ZIP_PASSWORD: "YOUR_ZIP_PASSWORD"
+      # AGENT_VERSION: "v2.3.1"

@@ -1,300 +1,215 @@
-#!/bin/bash
-# =============================================================================
-# Nezha v2 Dashboard Container - entrypoint
-# 仅兼容哪吒面板 V2（nezhahq/nezha），不兼容 legacy v0（naiba/nezha）与 V1。
-#
-# 关键修正（避免「配置探针后页面不显示服务器 / 页面报错」）：
-#   V2 把 agent 认证从「全局 agent_secret_key」改为「连接密钥与用户绑定」。
-#   但 V2 仍向后兼容全局密钥——它在启动时把 config.yaml 的 agent_secret_key
-#   注册为 user 0（见 nezhahq/nezha service/singleton/user.go:
-#   AgentSecretToUserId[Conf.AgentSecretKey] = 0）。
-#   因此必须把 NZ_AGENTKEY 同时写入 agent_secret_key 与 agent 的 client_secret，
-#   否则 agent 认证失败（「客户端认证失败」/ WAF 封 IP），服务器永远不显示。
-#
-# 启动顺序：
-#   1. 检查必需变量
-#   2. (可选) GitHub 恢复备份
-#   3. 生成自签证书 -> 下载 dashboard/agent 二进制（V2 线）
-#   4. (首次) 运行 dashboard 生成默认 config.yaml
-#   5. patch_config：强制 agent_secret_key / listen_port / force_auth / tsdb
-#   6. 启动 dashboard / nginx / (tunnel) / (agent)
-#   7. 看门狗 + 每小时备份/更新判断，保持容器常驻
-# =============================================================================
+#!/usr/bin/env bash
+set -Eeuo pipefail
 
-WORK_DIR=/app
-CONFIG_FILE="$WORK_DIR/data/config.yaml"
-AGENT_CONFIG="$WORK_DIR/config.yml"
-DASH_PORT=8008
-DEFAULT_DASHBOARD_VERSION="v2.3.4"
-DEFAULT_AGENT_VERSION="v2.3.3"
+# Nezha V2 only. V0/V1 URLs, flags, database formats and compatibility paths
+# are intentionally absent from this image.
+ROOT=/app
+DATA="$ROOT/data"
+CONFIG="$DATA/config.yaml"
+PORT=8008
+DASH_PID=""
+AGENT_PID=""
+TUNNEL_PID=""
+DEFAULT_DASH=v2.3.4
+DEFAULT_AGENT=v2.3.1
 export TZ="${TZ:-Asia/Shanghai}"
 
-log() { echo "[$(date '+%H:%M:%S')] $*"; }
+log() { echo "[$(date '+%F %T %Z')] $*"; }
+fail() { log "ERROR: $*"; exit 1; }
+true_value() { case "$(printf '%s' "${1:-}" | tr '[:upper:]' '[:lower:]')" in 1|true|yes|on) return 0;; *) return 1;; esac; }
 
-# --------------------------------------------------------------------------- #
-# 架构 / 工具函数
-# --------------------------------------------------------------------------- #
-case $(uname -m) in
-  x86_64)  ARCH=amd64 ;;
-  aarch64) ARCH=arm64 ;;
-  s390x)   ARCH=s390x ;;
-  *) log "Unsupported architecture: $(uname -m)"; exit 1 ;;
+case "$(uname -m)" in
+  x86_64) ARCH=amd64;;
+  aarch64) ARCH=arm64;;
+  s390x) ARCH=s390x;;
+  *) fail "不支持的架构: $(uname -m)";;
 esac
 
-is_true()  { case "$(printf '%s' "$1" | tr '[:upper:]' '[:lower:]')" in 1|true|yes|on) return 0;; *) return 1;; esac; }
-is_false() { case "$(printf '%s' "$1" | tr '[:upper:]' '[:lower:]')" in ""|0|false|no|off) return 0;; *) return 1;; esac; }
+v2_version() { [[ "$1" =~ ^v2\.[0-9]+\.[0-9]+$ ]] || fail "$2 必须是 v2.x.y: $1"; }
+host_only() { [[ "$1" != *"://"* && "$1" != */* && "$1" != *:* ]] || fail "$2 必须只填写域名: $1"; }
 
-# 设置顶层 YAML 字符串键（带引号）
-set_yaml_key() {
-  local key="$1" val="$2" esc
-  esc=$(printf '%s' "$val" | sed -e 's/[\\/&]/\\&/g')
-  if grep -q "^${key}:" "$CONFIG_FILE"; then
-    sed -i "s|^${key}:.*|${key}: \"${esc}\"|" "$CONFIG_FILE"
-  else
-    printf '%s: "%s"\n' "$key" "$esc" >> "$CONFIG_FILE"
-  fi
+latest_v2() {
+  curl -fsSL --max-time 30 "https://api.github.com/repos/$1/releases?per_page=100" 2>/dev/null \
+    | jq -r '.[] | select(.draft == false and .prerelease == false) | .tag_name' \
+    | grep -E '^v2\.[0-9]+\.[0-9]+$' | sort -V | tail -1 || true
 }
-# 设置顶层 YAML 原始值（数字 / 布尔，不带引号）
-set_yaml_key_raw() {
-  local key="$1" val="$2"
-  if grep -q "^${key}:" "$CONFIG_FILE"; then
-    sed -i "s|^${key}:.*|${key}: ${val}|" "$CONFIG_FILE"
-  else
-    printf '%s: %s\n' "$key" "$val" >> "$CONFIG_FILE"
-  fi
+
+download() {
+  local url="$1" out="$2" tmp="${2}.tmp"
+  log "下载 $url"
+  curl -fL --retry 3 --connect-timeout 15 --max-time 300 "$url" -o "$tmp" || fail "下载失败: $url"
+  mv "$tmp" "$out"
 }
-# 删除顶层 YAML 块（用于重写 tsdb）
-remove_yaml_block() {
-  local block="$1" tmp
+
+yaml_string() {
+  local key="$1" value="$2" escaped tmp
+  [[ "$value" != *$'\n'* && "$value" != *$'\r'* ]] || fail "$key 不能包含换行"
+  escaped=$(printf '%s' "$value" | sed -e 's/[\\&|]/\\&/g' -e 's/"/\\"/g')
   tmp=$(mktemp)
-  awk -v b="$block" 'BEGIN{s=0} $0 ~ ("^" b ":"){s=1;next} s{if($0 ~ /^[[:space:]]+/ || $0 ~ /^$/){next} s=0} {print}' "$CONFIG_FILE" > "$tmp" && mv "$tmp" "$CONFIG_FILE"
-}
-has_tsdb_env() {
-  [ -n "${NZ_TSDB_DATA_PATH+x}" ] || [ -n "${NZ_TSDB_RETENTION_DAYS+x}" ] || \
-  [ -n "${NZ_TSDB_MIN_FREE_DISK_SPACE_GB+x}" ] || [ -n "${NZ_TSDB_MAX_MEMORY_MB+x}" ] || \
-  [ -n "${NZ_TSDB_WRITE_BUFFER_SIZE+x}" ] || [ -n "${NZ_TSDB_WRITE_BUFFER_FLUSH_INTERVAL+x}" ]
-}
-# 跟踪 v2.x 最新 tag（避免误升到 v3）
-get_latest_v2_tag() {
-  curl -s --max-time 20 "https://api.github.com/repos/$1/tags?per_page=100" 2>/dev/null \
-    | grep -oE 'v2\.[0-9]+\.[0-9]+' | sort -V | tail -1
-}
-wait_for_config_file() {
-  local r=30
-  while [ ! -f "$CONFIG_FILE" ] && [ "$r" -gt 0 ]; do sleep 1; r=$((r-1)); done
-}
-check_env() {
-  [ -z "$NZ_AGENTKEY" ] && { log "ERROR: 必须设置环境变量 NZ_AGENTKEY"; exit 1; }
+  awk -v k="$key" -v v="$escaped" 'BEGIN{r=0} $0 ~ ("^" k ":[[:space:]]*"){print k ": \"" v "\"";r=1;next}{print}END{if(!r)print k ": \"" v "\""}' "$CONFIG" > "$tmp"
+  mv "$tmp" "$CONFIG"
 }
 
-# --------------------------------------------------------------------------- #
-# 证书 / 二进制 / 主题
-# --------------------------------------------------------------------------- #
-setup_ssl() {
-  local cn="${NZ_DOMAIN:-localhost}"
-  openssl genrsa -out "$WORK_DIR/nezha.key" 2048 2>/dev/null
-  openssl req -new -key "$WORK_DIR/nezha.key" -out "$WORK_DIR/nezha.csr" -subj "/CN=$cn" 2>/dev/null
-  openssl x509 -req -days 3650 -in "$WORK_DIR/nezha.csr" -signkey "$WORK_DIR/nezha.key" -out "$WORK_DIR/nezha.pem" 2>/dev/null
-  chmod 600 "$WORK_DIR/nezha.key"
-  chmod 644 "$WORK_DIR/nezha.pem"
+yaml_raw() {
+  local key="$1" value="$2" tmp
+  tmp=$(mktemp)
+  awk -v k="$key" -v v="$value" 'BEGIN{r=0} $0 ~ ("^" k ":[[:space:]]*"){print k ": " v;r=1;next}{print}END{if(!r)print k ": " v}' "$CONFIG" > "$tmp"
+  mv "$tmp" "$CONFIG"
 }
 
-download_binaries() {
-  local dv="${DASHBOARD_VERSION:-}"
-  [ -z "$dv" ] && dv=$(get_latest_v2_tag nezhahq/nezha)
-  [ -z "$dv" ] && dv="$DEFAULT_DASHBOARD_VERSION"
-  log "Dashboard 版本: $dv"
-  wget -q "https://github.com/nezhahq/nezha/releases/download/$dv/dashboard-linux-${ARCH}.zip" -O dash.zip \
-    || { log "ERROR: 下载 dashboard 失败 ($dv)"; exit 1; }
-  unzip -qo dash.zip -d "$WORK_DIR" && rm -f dash.zip
-  chmod +x "dashboard-linux-${ARCH}"
-
-  if [ -n "$IDU" ] && [ -n "$NZ_DOMAIN" ]; then
-    local av="${AGENT_VERSION:-}"
-    [ -z "$av" ] && av=$(get_latest_v2_tag nezhahq/agent)
-    [ -z "$av" ] && av="$DEFAULT_AGENT_VERSION"
-    log "Agent 版本: $av"
-    wget -q "https://github.com/nezhahq/agent/releases/download/$av/nezha-agent_linux_${ARCH}.zip" -O agent.zip \
-      || { log "ERROR: 下载 agent 失败 ($av)"; exit 1; }
-    unzip -qo agent.zip -d "$WORK_DIR" && rm -f agent.zip
-    chmod +x nezha-agent
-  fi
+remove_block() {
+  local key="$1" tmp
+  tmp=$(mktemp)
+  awk -v k="$key" '$0 ~ ("^" k ":[[:space:]]*$"){skip=1;next} skip && ($0 ~ /^[[:space:]]/ || $0 ~ /^$/){next}{skip=0;print}' "$CONFIG" > "$tmp"
+  mv "$tmp" "$CONFIG"
 }
 
-apply_extra_user_theme() {
-  [ -z "$NZ_EXTRA_USER_THEME" ] && return 0
-  local zip="$WORK_DIR/extra-theme.zip" tmp="$WORK_DIR/.extra-theme"
-  rm -rf "$tmp"; mkdir -p "$tmp"
-  if ! wget -q "$NZ_EXTRA_USER_THEME" -O "$zip"; then
-    log "WARN: 主题下载失败，跳过"; rm -f "$zip"; return 0
-  fi
-  if ! unzip -qo "$zip" -d "$tmp"; then
-    log "WARN: 主题解压失败，跳过"; rm -f "$zip"; rm -rf "$tmp"; return 0
-  fi
-  local root
-  root=$(find "$tmp" -mindepth 1 -maxdepth 2 -type f -name 'index.html' | head -n1 | xargs -r dirname)
-  [ -z "$root" ] && root=$(find "$tmp" -mindepth 1 -maxdepth 1 -type d | head -n1)
-  [ -z "$root" ] && root="$tmp"
-  rm -rf "$WORK_DIR/user-dist"; mkdir -p "$WORK_DIR/user-dist"
-  cp -r "$root"/. "$WORK_DIR/user-dist/" && log "用户主题已应用: $NZ_EXTRA_USER_THEME"
-  rm -f "$zip"; rm -rf "$tmp"
+setup_tls() {
+  [[ -s "$ROOT/nezha.pem" && -s "$ROOT/nezha.key" ]] && return
+  openssl req -x509 -nodes -newkey rsa:2048 -days 3650 -subj "/CN=${NZ_DOMAIN:-localhost}" \
+    -keyout "$ROOT/nezha.key" -out "$ROOT/nezha.pem" >/dev/null 2>&1 || fail "生成 TLS 证书失败"
+  chmod 600 "$ROOT/nezha.key"
 }
 
-# --------------------------------------------------------------------------- #
-# 配置 patch（环境变量为权威来源）
-# --------------------------------------------------------------------------- #
+get_dashboard() {
+  local version="${DASHBOARD_VERSION:-}"
+  [[ -n "$version" ]] || version=$(latest_v2 nezhahq/nezha)
+  version="${version:-$DEFAULT_DASH}"
+  v2_version "$version" DASHBOARD_VERSION
+  download "https://github.com/nezhahq/nezha/releases/download/$version/dashboard-linux-${ARCH}.zip" "$ROOT/dashboard.zip"
+  unzip -qo "$ROOT/dashboard.zip" -d "$ROOT" || fail "Dashboard 解压失败"
+  rm -f "$ROOT/dashboard.zip"
+  chmod +x "$ROOT/dashboard-linux-${ARCH}"
+}
+
+get_agent() {
+  [[ -n "${IDU:-}" && -n "${NZ_DOMAIN:-}" ]] || return
+  local version="${AGENT_VERSION:-}"
+  [[ -n "$version" ]] || version=$(latest_v2 nezhahq/agent)
+  version="${version:-$DEFAULT_AGENT}"
+  v2_version "$version" AGENT_VERSION
+  download "https://github.com/nezhahq/agent/releases/download/$version/nezha-agent_linux_${ARCH}.zip" "$ROOT/agent.zip"
+  unzip -qo "$ROOT/agent.zip" -d "$ROOT" || fail "Agent 解压失败"
+  rm -f "$ROOT/agent.zip"
+  chmod +x "$ROOT/nezha-agent"
+}
+
 patch_config() {
-  # 【关键】V2 把 agent_secret_key 注册为 user 0（全局密钥，向后兼容）。
-  # 必须把 NZ_AGENTKEY 写入此处，且自监控 agent 的 client_secret 也用同一值，
-  # 否则 agent 认证失败、服务器不显示。这是 ydmmocoo/nezha_v1 报错的根因。
-  set_yaml_key "agent_secret_key" "$NZ_AGENTKEY"
-  grep -q "^agentsecretkey:" "$CONFIG_FILE" && set_yaml_key "agentsecretkey" "$NZ_AGENTKEY"
-
-  # JWT 签名密钥：生产推荐用 NZ_JWTSECRETKEY 注入，避免 V2.0.13+ 自动轮转导致频繁登出
-  [ -n "$NZ_JWTSECRETKEY" ] && set_yaml_key "jwt_secret_key" "$NZ_JWTSECRETKEY"
-
-  # 访客可见性：FORCE_AUTH=true -> 强制登录（更安全，推荐）；false -> 允许访客查看公开状态页
-  set_yaml_key_raw "force_auth" "$(is_true "$FORCE_AUTH" && echo true || echo false)"
-
-  # 固定监听端口，nginx 反代到 8008（Web + gRPC 复用，V2 端点 /proto.NezhaService/）
-  set_yaml_key_raw "listen_port" "$DASH_PORT"
-  set_yaml_key "listen_host" "0.0.0.0"
-  set_yaml_key "location" "${TZ}"
-  if [ -n "$NZ_DOMAIN" ]; then
-    set_yaml_key "install_host" "$NZ_DOMAIN"
-    set_yaml_key_raw "tls" "true"
+  yaml_raw listen_port "$PORT"
+  yaml_string listen_host 0.0.0.0
+  yaml_string location "$TZ"
+  yaml_raw force_auth "$(true_value "${FORCE_AUTH:-true}" && echo true || echo false)"
+  yaml_string web_real_ip_header nz-realip
+  yaml_string agent_real_ip_header nz-realip
+  if [[ -n "${NZ_DOMAIN:-}" ]]; then
+    local p="${NZ_AGENT_PORT:-443}"
+    [[ "$p" =~ ^[0-9]+$ && "$p" -ge 1 && "$p" -le 65535 ]] || fail "NZ_AGENT_PORT 无效"
+    yaml_string install_host "${NZ_DOMAIN}:${p}"
+    yaml_raw tls true
   fi
-  # 反代 / 公网域名：声明 OAuth2 回调 Host 与 NAT 保留域名（Northflank 等反代场景建议设置）
-  [ -n "$NZ_DASHBOARD_HOST" ] && set_yaml_key "dashboard_host" "$NZ_DASHBOARD_HOST"
-
-  # TSDB 历史指标
-  if [ -n "${NZ_ENABLE_TSDB+x}" ] || has_tsdb_env; then
-    if is_false "$NZ_ENABLE_TSDB"; then
-      remove_yaml_block "tsdb"
-      log "TSDB 已按环境变量关闭"
-    else
-      local p="${NZ_TSDB_DATA_PATH:-/app/tsdb}" r="${NZ_TSDB_RETENTION_DAYS:-7}" \
-            mf="${NZ_TSDB_MIN_FREE_DISK_SPACE_GB:-0.3}" mm="${NZ_TSDB_MAX_MEMORY_MB:-64}" \
-            wb="${NZ_TSDB_WRITE_BUFFER_SIZE:-128}" wf="${NZ_TSDB_WRITE_BUFFER_FLUSH_INTERVAL:-5}"
-      remove_yaml_block "tsdb"
-      mkdir -p "$p"
-      cat <<EOF >> "$CONFIG_FILE"
+  [[ -z "${NZ_DASHBOARD_HOST:-}" ]] || yaml_string reserved_hosts "$NZ_DASHBOARD_HOST"
+  [[ -z "${NZ_JWTSECRETKEY:-}" ]] || yaml_string jwt_secret_key "$NZ_JWTSECRETKEY"
+  if [[ -n "${NZ_ENABLE_TSDB+x}" || -n "${NZ_TSDB_DATA_PATH+x}" || -n "${NZ_TSDB_RETENTION_DAYS+x}" ]]; then
+    if true_value "${NZ_ENABLE_TSDB:-true}"; then
+      local path="${NZ_TSDB_DATA_PATH:-$DATA/tsdb}"
+      remove_block tsdb
+      mkdir -p "$path"
+      cat >> "$CONFIG" <<EOF
 tsdb:
-  data_path: "$p"
-  retention_days: $r
-  min_free_disk_space_gb: $mf
-  max_memory_mb: $mm
-  write_buffer_size: $wb
-  write_buffer_flush_interval: $wf
+  data_path: "$path"
+  retention_days: ${NZ_TSDB_RETENTION_DAYS:-30}
+  min_free_disk_space_gb: ${NZ_TSDB_MIN_FREE_DISK_SPACE_GB:-1}
+  max_memory_mb: ${NZ_TSDB_MAX_MEMORY_MB:-256}
+  write_buffer_size: ${NZ_TSDB_WRITE_BUFFER_SIZE:-512}
+  write_buffer_flush_interval: ${NZ_TSDB_WRITE_BUFFER_FLUSH_INTERVAL:-5}
 EOF
-      log "TSDB 已启用，数据目录: $p"
+    else
+      remove_block tsdb
     fi
-  else
-    log "TSDB 未配置，保持原样"
   fi
 }
 
-# --------------------------------------------------------------------------- #
-# 服务启停
-# --------------------------------------------------------------------------- #
-start_dashboard() { nohup "./dashboard-linux-${ARCH}" >/dev/null 2>&1 & }
-start_nginx()     { nginx >/dev/null 2>&1 & }
-
-start_tunnel() {
-  [ -z "$ARGO_AUTH" ] && return 0
-  local cf="cloudflared-linux-${ARCH}"
-  if [ ! -f "$cf" ]; then
-    wget -q "https://github.com/cloudflare/cloudflared/releases/latest/download/$cf" -O "$cf" && chmod +x "$cf" || return 0
-  fi
-  nohup "./$cf" tunnel --protocol http2 run --token "$ARGO_AUTH" >/dev/null 2>&1 &
+start_dashboard() {
+  if [[ -n "$DASH_PID" ]] && kill -0 "$DASH_PID" 2>/dev/null; then return; fi
+  "$ROOT/dashboard-linux-${ARCH}" >>/proc/1/fd/1 2>>/proc/1/fd/2 & DASH_PID=$!
 }
 
 start_agent() {
-  [ -z "$IDU" ] || [ -z "$NZ_DOMAIN" ] && return 0
-  cat > "$AGENT_CONFIG" <<EOF
-client_secret: $NZ_AGENTKEY
-debug: false
+  [[ -n "${IDU:-}" && -n "${NZ_DOMAIN:-}" && -n "${NZ_SELF_CLIENT_SECRET:-}" ]] || return
+  cat > "$ROOT/config.yml" <<EOF
+client_secret: "$NZ_SELF_CLIENT_SECRET"
+debug: ${NZ_SELF_AGENT_DEBUG:-false}
 disable_auto_update: true
-disable_command_execute: false
+disable_command_execute: ${NZ_AGENT_DISABLE_COMMAND_EXECUTE:-true}
 disable_force_update: true
-disable_nat: false
+disable_nat: ${NZ_AGENT_DISABLE_NAT:-true}
 disable_send_query: false
 gpu: false
 insecure_tls: false
 ip_report_period: 1800
-report_delay: 4
-server: $NZ_DOMAIN:443
+report_delay: 3
+server: ${NZ_DOMAIN}:${NZ_AGENT_PORT:-443}
 skip_connection_count: false
 skip_procs_count: false
 temperature: false
 tls: true
+use_atomgit_to_upgrade: false
 use_gitee_to_upgrade: false
 use_ipv6_country_code: false
 uuid: $IDU
 EOF
-  nohup ./nezha-agent >/dev/null 2>&1 &
+  "$ROOT/nezha-agent" -c "$ROOT/config.yml" >>/proc/1/fd/1 2>>/proc/1/fd/2 & AGENT_PID=$!
 }
 
-watchdog() {
-  pgrep -f "dashboard-linux-${ARCH}" >/dev/null 2>&1 || { log "watchdog: dashboard 掉线，重启"; start_dashboard; }
-  pgrep -f "nginx: master"       >/dev/null 2>&1 || { log "watchdog: nginx 掉线，重启"; start_nginx; }
-  [ -n "$ARGO_AUTH" ] && { pgrep -f "cloudflared-linux-${ARCH}" >/dev/null 2>&1 || start_tunnel; }
-  if [ -n "$IDU" ] && [ -n "$NZ_DOMAIN" ]; then pgrep -f "nezha-agent" >/dev/null 2>&1 || start_agent; fi
+start_tunnel() {
+  [[ -n "${ARGO_AUTH:-}" ]] || return
+  [[ "$ARCH" == amd64 || "$ARCH" == arm64 ]] || fail "Cloudflare Tunnel 不支持架构: $ARCH"
+  local bin="$ROOT/cloudflared-linux-${ARCH}"
+  [[ -x "$bin" ]] || { download "https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-${ARCH}" "$bin"; chmod +x "$bin"; }
+  "$bin" tunnel --no-autoupdate --protocol http2 run --token "$ARGO_AUTH" >>/proc/1/fd/1 2>>/proc/1/fd/2 & TUNNEL_PID=$!
 }
 
-# --------------------------------------------------------------------------- #
-# 主流程
-# --------------------------------------------------------------------------- #
+stop_all() {
+  trap - TERM INT EXIT
+  [[ -z "$TUNNEL_PID" ]] || kill "$TUNNEL_PID" 2>/dev/null || true
+  [[ -z "$AGENT_PID" ]] || kill "$AGENT_PID" 2>/dev/null || true
+  [[ -z "$DASH_PID" ]] || kill "$DASH_PID" 2>/dev/null || true
+  nginx -s quit >/dev/null 2>&1 || true
+}
+trap stop_all TERM INT EXIT
+
 main() {
-  check_env
-  [ -f "restore.sh" ] && bash restore.sh
-  mkdir -p "$WORK_DIR/data"
-  setup_ssl
-  download_binaries
-  apply_extra_user_theme
-
-  if [ ! -f "$CONFIG_FILE" ]; then
-    log "首次启动，先运行 dashboard 生成默认配置..."
+  cd "$ROOT"
+  [[ -z "${NZ_SELF_CLIENT_SECRET:-}" || ( "$NZ_SELF_CLIENT_SECRET" != *$'\n'* && "$NZ_SELF_CLIENT_SECRET" != *$'\r'* ) ]] || fail "NZ_SELF_CLIENT_SECRET 不能包含换行"
+  [[ -z "${NZ_DOMAIN:-}" ]] || host_only "$NZ_DOMAIN" NZ_DOMAIN
+  [[ -z "${NZ_DASHBOARD_HOST:-}" ]] || host_only "$NZ_DASHBOARD_HOST" NZ_DASHBOARD_HOST
+  [[ -z "${IDU:-}" || -n "${NZ_DOMAIN:-}" ]] || fail "设置 IDU 时必须同时设置 NZ_DOMAIN"
+  [[ -z "${IDU:-}" || -n "${NZ_SELF_CLIENT_SECRET:-}" ]] || fail "设置 IDU 时必须同时设置 NZ_SELF_CLIENT_SECRET"
+  mkdir -p "$DATA"
+  setup_tls
+  get_dashboard
+  get_agent
+  if [[ ! -s "$CONFIG" ]]; then
+    log "首次运行，生成 V2 默认配置"
     start_dashboard
-    wait_for_config_file
-    pkill -f "dashboard-linux-${ARCH}" 2>/dev/null || true
-    sleep 1
+    local n=60
+    while [[ ! -s "$CONFIG" && "$n" -gt 0 ]]; do sleep 1; n=$((n-1)); done
+    [[ -s "$CONFIG" ]] || fail "Dashboard 未生成 $CONFIG"
+    kill "$DASH_PID" 2>/dev/null || true; wait "$DASH_PID" 2>/dev/null || true; DASH_PID=""
   fi
-
   patch_config
-
-  log "启动服务..."
   start_dashboard
   sleep 2
-  start_nginx
+  nginx -t >/dev/null 2>&1 || fail "nginx 配置校验失败"
+  nginx >/dev/null 2>&1 || fail "nginx 启动失败"
   start_tunnel
   start_agent
-  log "启动完成。Web 监听容器 80 端口；agent 经 443 / 隧道上报到 dashboard:8008。"
+  log "Nezha V2 已启动，nginx :80 -> Dashboard :$PORT"
+  while sleep 30; do
+    if [[ -z "$DASH_PID" ]] || ! kill -0 "$DASH_PID" 2>/dev/null; then log "Dashboard 已退出，重启"; start_dashboard; fi
+    if ! pgrep -x nginx >/dev/null 2>&1; then log "nginx 已退出，重启"; nginx >/dev/null 2>&1 || true; fi
+    if [[ -n "$AGENT_PID" ]] && ! kill -0 "$AGENT_PID" 2>/dev/null; then AGENT_PID=""; start_agent; fi
+    if [[ -n "$TUNNEL_PID" ]] && ! kill -0 "$TUNNEL_PID" 2>/dev/null; then TUNNEL_PID=""; start_tunnel; fi
+  done
 }
-
-main
-
-# --------------------------------------------------------------------------- #
-# 常驻循环：看门狗（每分钟） + 备份/更新判断（每小时）
-# --------------------------------------------------------------------------- #
-tick=0
-while true; do
-  sleep 60
-  watchdog
-  tick=$((tick + 1))
-  if [ "$tick" -ge 60 ]; then
-    tick=0
-    if [ -n "$GITHUB_USERNAME" ] && [ -n "$REPO_NAME" ] && [ -n "$GITHUB_TOKEN" ] && [ -n "$ZIP_PASSWORD" ]; then
-      current_date=$(date +"%Y-%m-%d"); current_hour=$(date +"%H")
-      readme_content=$(curl -s -H "Authorization: token $GITHUB_TOKEN" -H "Accept: application/vnd.github.v3.raw" \
-        "https://api.github.com/repos/$GITHUB_USERNAME/$REPO_NAME/contents/README.md" 2>/dev/null)
-      file_date=$(echo "$readme_content" | sed -n 's/^data-\([0-9]\{4\}-[0-9]\{2\}-[0-9]\{2\}\)-.*\.zip$/\1/p')
-      if { [ "$file_date" != "$current_date" ] && [ "$current_hour" -eq 4 ]; } || [ "$readme_content" = "backup" ]; then
-        [ -f "backup.sh" ] && bash backup.sh
-        [ -z "$DASHBOARD_VERSION" ] && [ -f "renew.sh" ] && bash renew.sh
-      fi
-    else
-      [ -z "$DASHBOARD_VERSION" ] && [ -f "renew.sh" ] && bash renew.sh
-    fi
-  fi
-done
+main "$@"

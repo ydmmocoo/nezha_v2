@@ -1,6 +1,8 @@
-_ref/
-data/
-*.md~
-.git/
+.git
 .gitignore
-Dockerfile.dev
+.dockerignore
+data
+*.env
+*.env.*
+README.md~
+_ref
