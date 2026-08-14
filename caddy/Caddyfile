@@ -1,0 +1,7 @@
+:8080 {
+    encode gzip
+
+    @grpc header Content-Type application/grpc*
+    reverse_proxy @grpc h2c://127.0.0.1:8008
+    reverse_proxy 127.0.0.1:8008
+}

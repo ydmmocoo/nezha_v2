@@ -1,1 +1,24 @@
 .workbuddy/
+
+# Local secrets and environment files
+.env
+.env.*
+!.env.example
+
+# Runtime state and local deployment data
+data/
+logs/
+cloudflared/credentials.json
+*.db
+*.sqlite
+*.sqlite3
+*.log
+
+# Local backups and temporary archives
+*.tar.gz
+*.zip
+*.tmp
+
+# OS/editor files
+.DS_Store
+Thumbs.db

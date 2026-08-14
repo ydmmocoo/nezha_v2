@@ -1,0 +1,26 @@
+services:
+  nezha-v2-argo:
+    build: .
+    image: nezha-v2-argo:latest
+    restart: unless-stopped
+    ports:
+      - "${HTTP_PORT:-8080}:${HTTP_PORT:-8080}"
+    environment:
+      TZ: Asia/Shanghai
+      ARGO_DOMAIN: ${ARGO_DOMAIN:?set ARGO_DOMAIN}
+      ARGO_TOKEN: ${ARGO_TOKEN:-}
+      ARGO_AUTH: ${ARGO_AUTH:-}
+      GH_REPO: ${GH_REPO:-}
+      GH_PAT: ${GH_PAT:-}
+      GH_BRANCH: ${GH_BRANCH:-main}
+      BACKUP_RETENTION: ${BACKUP_RETENTION:-7}
+      LOCAL_AGENT_SECRET: ${LOCAL_AGENT_SECRET:-}
+      LOCAL_AGENT_ENABLED: ${LOCAL_AGENT_ENABLED:-true}
+      LOCAL_AGENT_SERVER: ${LOCAL_AGENT_SERVER:-}
+      LOCAL_AGENT_TLS: ${LOCAL_AGENT_TLS:-true}
+      SELF_UPDATE_REPO: ${SELF_UPDATE_REPO:-}
+    volumes:
+      - nezha-data:/opt/nezha/data
+
+volumes:
+  nezha-data:
