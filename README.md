@@ -107,9 +107,9 @@ git push
 
 | 变量                               | 说明                                                               |
 | -------------------------------- | ---------------------------------------------------------------- |
-| `NZ_DOMAIN`                      | Agent 连接的公网域名。与 `IDU` 同时填写时，容器会启动内置 Agent。只填写域名，不要填写 `https://`。 |
+| `NZ_DOMAIN`                      | 配置给 Agent 使用的公网域名。与 `IDU` 同时填写时，容器会启动内置 Agent。只填写域名，不要填写 `https://`；如果使用 Cloudflare Tunnel，需要与 Public Hostname 完全一致。 |
 | `IDU`                            | 面板自监控服务器对应的 UUID。建议使用哪吒面板中该服务器的实际 UUID。                          |
-| `ARGO_AUTH`                      | Cloudflare Tunnel Token。设置后会启动 cloudflared。                      |
+| `ARGO_AUTH`                      | Cloudflare Tunnel Token。当前脚本只支持 Token，不支持 JSON；设置后会启动 cloudflared。 |
 | `NZ_EXTRA_USER_THEME`            | 自定义用户主题 ZIP 下载地址。                                                |
 | `NZ_ENABLE_TSDB`                 | 设置为 `true` 启用 TSDB 历史指标，设置为 `false` 关闭。                          |
 | `NZ_TSDB_DATA_PATH`              | TSDB 路径。Northflank 建议设置为 `/app/data/tsdb`。                       |
@@ -371,28 +371,199 @@ ${NZ_DOMAIN}:443
 - Dashboard 的 `agent_secret_key` 是否已经写入；
 - Northflank 日志中是否出现 Agent 认证失败。
 
-## 使用 Cloudflare Tunnel（可选）
+## 使用 Cloudflare Tunnel 自定义域名（Token 模式）
 
-如果不希望使用 Northflank 公网域名作为 Agent 地址，可以使用 Cloudflare Tunnel。
+本项目支持通过 Cloudflare Tunnel 使用自定义域名访问面板。
 
-1. 在 Cloudflare Zero Trust 创建 Tunnel；
-2. 创建 Public Hostname，例如 `nezha.example.com`；
-3. 将 Public Hostname 的 Service 指向：
-   ```text
-   http://localhost:80
-   ```
-4. 确认 Cloudflare Tunnel 开启 HTTP/2 或 gRPC 支持；
-5. 将 Tunnel Token 写入 Northflank 环境变量：
-   ```text
-   ARGO_AUTH=<Cloudflare Tunnel Token>
-   ```
-6. 将 Agent 域名设置为：
-   ```text
-   NZ_DOMAIN=nezha.example.com
-   ```
-7. 如果需要容器自监控，再同时填写 `IDU`。
+本项目当前只支持 **Cloudflare Tunnel Token**，不使用 JSON 配置。启动脚本实际执行的是：
 
-使用 Tunnel 时，Northflank 的 `80/HTTP2` 公网端口仍建议保留，便于访问面板、查看健康状态和排查问题。
+```bash
+cloudflared tunnel --protocol http2 run --token "$ARGO_AUTH"
+```
+
+因此不要把 JSON 配置、`cert.pem`、Cloudflare API Token 或 Global API Key 填入 `ARGO_AUTH`。
+
+域名由 Cloudflare 的 **Public Hostname** 配置，以及本项目的 `NZ_DOMAIN`、`NZ_DASHBOARD_HOST` 两个变量共同完成。
+
+### 变量关系
+
+| 变量 | 用途 | 示例 |
+|---|---|---|
+| `NZ_DOMAIN` | 哪吒 Agent 的连接域名；同时用于生成安装地址和容器自监控 Agent 的连接地址 | `nazha.example.com` |
+| `NZ_DASHBOARD_HOST` | Dashboard 对外访问域名，主要用于 OAuth2 回调、反向代理和 NAT 保留域名 | `nazha.example.com` |
+| `ARGO_AUTH` | Cloudflare Tunnel Token，只填 Token 字符串 | `eyJhIjoi...` |
+| `IDU` | 可选。填写后启动容器内置自监控 Agent | `11111111-2222-3333-4444-555555555555` |
+
+如果使用同一个域名访问面板并连接 Agent，推荐四项这样填写：
+
+```text
+NZ_DOMAIN=nazha.example.com
+NZ_DASHBOARD_HOST=nazha.example.com
+ARGO_AUTH=<Cloudflare Tunnel Token>
+IDU=<可选的自监控服务器UUID>
+```
+
+`NZ_DOMAIN` 和 `NZ_DASHBOARD_HOST` 只填写域名，不要包含：
+
+```text
+https://
+http://
+/
+:443
+```
+
+### 第一步：在 Cloudflare 创建 Tunnel
+
+1. 登录 [Cloudflare Zero Trust](https://one.dash.cloudflare.com/)；
+2. 进入 **Networks → Tunnels**；
+3. 创建一个 Named Tunnel；
+4. 在 Tunnel 的连接器页面选择 Docker 或 Token 方式；
+5. 复制 Cloudflare 生成的 Tunnel Token；
+6. 将 Token 写入 Northflank 的 Secret 环境变量：
+
+   ```text
+   ARGO_AUTH=<完整的Cloudflare Tunnel Token>
+   ```
+
+Token 通常是一段很长的字符串，常见形式以 `eyJ` 开头。不要手动添加换行，也不要把 Token 截断。
+
+### 第二步：配置 Public Hostname
+
+在刚创建的 Tunnel 中添加 **Published application / Public Hostname**：
+
+```text
+Hostname: nazha.example.com
+```
+
+当前容器内 nginx 同时监听 `80` 和 `443`。如果要尝试让 Cloudflare Tunnel 同时承载网页和 Agent 的 TLS/gRPC 流量，回源 Service 可设置为：
+
+```text
+https://localhost:443
+```
+
+容器的 `443` 使用启动脚本生成的自签名证书，因此在 Cloudflare Tunnel 的 Origin Parameters 中关闭源站证书校验：
+
+```text
+No TLS Verify: Enabled
+HTTP/2 to Origin: Enabled（如果控制台提供此选项）
+```
+
+如果只需要通过 Tunnel 访问网页，也可以将 Service 设置为：
+
+```text
+http://localhost:80
+```
+
+该配置只适合网页访问；哪吒 Agent 使用 gRPC，网页能打开并不代表 Agent 一定能通过 Tunnel 上线。生产环境请优先准备 Northflank 的 HTTP/2 公网域名作为 Agent 回退地址，详见下方“关于 gRPC 的兼容性”。
+
+`ARGO_AUTH` 只负责让容器内的 `cloudflared` 连接到已有 Tunnel，不会自动创建 Public Hostname、DNS 记录或回源 Service；这些仍需在 Cloudflare 控制台完成。
+
+Cloudflare 官方文档中，Published application 的核心就是把公网 hostname 映射到本地服务，例如 `http://localhost:80`；如果使用 HTTPS 回源，则需要配置 `https://localhost:443` 及源站 TLS 参数。[Cloudflare Tunnel 路由文档](https://developers.cloudflare.com/tunnel/routing/)
+
+### 第三步：检查 DNS
+
+如果通过 Cloudflare 控制台为 Tunnel 添加 Public Hostname，Cloudflare 通常会自动创建指向 Tunnel 的 DNS 记录。
+
+手动配置时，应创建：
+
+```text
+Type: CNAME
+Name: nazha
+Target: <Tunnel UUID>.cfargotunnel.com
+Proxy status: Proxied
+```
+
+最终访问域名应为：
+
+```text
+https://nazha.example.com
+```
+
+不要只创建一个普通 A 记录指向 Northflank 或其他服务器 IP。Cloudflare Tunnel 需要将域名指向对应的 `<Tunnel UUID>.cfargotunnel.com`。 [Cloudflare Tunnel DNS 文档](https://developers.cloudflare.com/cloudflare-one/networks/connectors/cloudflare-tunnel/routing-to-tunnel/dns/)
+
+### 第四步：配置 Northflank
+
+Northflank 中建议保留一个容器 `80` 的公网 HTTP/2 端口，用于健康检查和备用访问：
+
+```text
+Container port: 80
+Protocol: HTTP/2
+Public: Enabled
+```
+
+不要把容器 `443` 再配置成 Northflank 公网端口。Cloudflare Tunnel 访问的是同一个容器内部的 `localhost:443`，不是 Northflank 的公网端口。
+
+推荐的完整环境变量：
+
+```text
+NZ_AGENTKEY=<哪吒Agent密钥>
+NZ_JWTSECRETKEY=<固定JWT密钥>
+FORCE_AUTH=true
+NZ_DOMAIN=nazha.example.com
+NZ_DASHBOARD_HOST=nazha.example.com
+ARGO_AUTH=<Cloudflare Tunnel Token>
+```
+
+如果不需要容器自监控，不填写 `IDU`。如果需要自监控，将哪吒面板中对应服务器的 UUID 填入：
+
+```text
+IDU=<服务器UUID>
+```
+
+### 第五步：验证访问链路
+
+部署完成后，按顺序检查：
+
+1. Cloudflare Tunnel 状态为 **Healthy**；
+2. Tunnel 至少有一个在线 Connector；
+3. Public Hostname 与 `NZ_DOMAIN` 完全一致；
+4. Service URL 为 `https://localhost:443` 或 `http://localhost:80`；
+5. Northflank 容器正在运行；
+6. 容器内 nginx 已监听 `80/443`；
+7. 访问：
+
+   ```text
+   https://nazha.example.com
+   ```
+
+如果网页打不开，可以在 Northflank Terminal 中检查容器内部服务：
+
+```bash
+pgrep -af cloudflared
+wget -S -O - http://127.0.0.1:80/
+wget --no-check-certificate -S -O - https://127.0.0.1:443/
+```
+
+结果判断：
+
+| 现象 | 常见原因 |
+|---|---|
+| `404` | Public Hostname 没有配置为 `nazha.example.com`，或 Hostname 拼写不一致 |
+| `502` | Tunnel 已连接，但 `localhost:80/443` 回源失败 |
+| `1016` | DNS 指向 Tunnel，但没有在线 Connector |
+| 网页能打开、Agent 不上线 | gRPC/HTTP2 回源未开启，或 Agent 密钥不匹配 |
+| 容器没有 `cloudflared` 进程 | Token 无效、下载失败或 Tunnel 启动失败 |
+
+注意：当前脚本会将 cloudflared 的标准输出写入 `/dev/null`。如果需要查看 Tunnel 的详细错误，建议先检查进程状态和 Cloudflare Tunnel 控制台中的 Connector 日志。
+
+### 关于 gRPC 的兼容性
+
+哪吒 Agent 通过 gRPC 连接 Dashboard。Cloudflare 当前文档说明，Tunnel 的 gRPC 支持主要面向私网路由，Public Hostname 的公网发布场景存在产品限制；因此如果网页可以访问但 Agent 始终不上线，最稳妥的方式是：
+
+- Cloudflare 域名用于浏览器访问；
+- Northflank 的 HTTP/2 公网域名用于 Agent 通信；
+- 将 `NZ_DOMAIN` 改为 Northflank 公网域名；
+- 将 `NZ_DASHBOARD_HOST` 保留为 Cloudflare 自定义域名。
+
+例如：
+
+```text
+NZ_DOMAIN=web--nezha--abc123.code.run
+NZ_DASHBOARD_HOST=nazha.example.com
+ARGO_AUTH=<Cloudflare Tunnel Token>
+```
+
+这样可以同时保留 Cloudflare 自定义域名访问，并避免 Agent 依赖 Cloudflare Tunnel 的 gRPC 公网转发。详见 [Cloudflare gRPC 文档](https://developers.cloudflare.com/cloudflare-one/networks/connectors/cloudflare-tunnel/use-cases/grpc/)。
 
 ## 备份与恢复
 
@@ -595,4 +766,3 @@ LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
 ```
-
