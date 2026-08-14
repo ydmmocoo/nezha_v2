@@ -12,6 +12,7 @@
 - 每日同步上游安装脚本，并可选同步本项目脚本
 - 每日将哪吒数据、隧道凭据和本机 Agent 配置备份到 GitHub
 - 保留指定数量的历史备份，并支持从 GitHub 手动恢复
+- 无持久化磁盘时，启动前自动从 GitHub 恢复最近备份
 
 ## 运行结构
 
@@ -26,7 +27,7 @@ Caddy :8080  ── HTTP/2 h2c / WebSocket ──▶ Dashboard :8008
                                                   └── SQLite / data
 ```
 
-Northflank 只需要提供容器运行环境和持久化卷；公网访问及 Agent 通信都通过 Argo 域名进入，不要求 Northflank 为该服务提供额外公网入口。Cloudflare Tunnel 本身是由容器主动连接 Cloudflare 边缘的连接器。[Cloudflare Tunnel 文档](https://developers.cloudflare.com/cloudflare-one/networks/connectors/cloudflare-tunnel/) 和 [cloudflared 项目说明](https://github.com/cloudflare/cloudflared) 可供核对。
+Northflank 不需要额外公网入口。免费实例没有持久化卷时，容器会在启动前从 GitHub 私有备份仓库自动恢复最近的 SQLite 和配置；因此必须配置 `GH_REPO`、`GH_PAT`，并确保至少成功生成过一次备份。Cloudflare Tunnel 本身是由容器主动连接 Cloudflare 边缘的连接器。[Cloudflare Tunnel 文档](https://developers.cloudflare.com/cloudflare-one/networks/connectors/cloudflare-tunnel/) 和 [cloudflared 项目说明](https://github.com/cloudflare/cloudflared) 可供核对。
 
 ## 一、部署前准备
 
@@ -63,7 +64,7 @@ V2 的 `client_secret` 与用户绑定，不能使用 V0 时代的全局 `agent_
 4. 复制生成的安装命令，从中取出 `NZ_CLIENT_SECRET` 的值。
 5. 将该值填入 Northflank 的 `LOCAL_AGENT_SECRET`，重新部署/重启服务。
 
-容器会使用这个密钥启动内置 Agent，默认连接 `${ARGO_DOMAIN}:443`，并在面板中显示本机资源。V2 官方文档也说明，Agent 连接密钥应从服务器页面生成的安装命令中取得。[Agent 配置](https://nezha.wiki/configuration/agent.html) 和 [服务器管理](https://nezha.wiki/guide/servers.html)。
+容器会使用这个密钥启动内置 Agent。由于 Agent 与 Dashboard 在同一个容器内，默认直接连接 `127.0.0.1:8008`，不经过 Argo 公网域名；这样可以避免 Cloudflare Public Hostname 对 gRPC 的限制。V2 官方文档也说明，Agent 连接密钥应从服务器页面生成的安装命令中取得。[Agent 配置](https://nezha.wiki/configuration/agent.html) 和 [服务器管理](https://nezha.wiki/guide/servers.html)。
 
 ## 二、Northflank 部署
 
@@ -77,14 +78,7 @@ V2 的 `client_secret` 与用户绑定，不能使用 V0 时代的全局 `agent_
 4. 连接本项目 GitHub 仓库，分支选择 `main`。
 5. Build method 选择 **Dockerfile**，路径填写 `/Dockerfile`。
 6. Service port 添加 `8080`，协议选择 HTTP。
-7. 添加一个持久化卷，挂载到：
-
-   ```text
-   /opt/nezha/data
-   ```
-
-   至少给 1 GiB；如果服务器多、历史数据多，建议 5 GiB 或更大。
-
+7. 持久化卷是可选的。免费实例无法挂载卷时，必须配置 GitHub 备份，并保持 `AUTO_RESTORE_ON_START=true`；如果可以使用卷，仍建议挂载到 `/opt/nezha/data` 以减少恢复等待时间。
 8. CPU 建议至少 0.25 vCPU，内存建议至少 512 MiB。
 
 Northflank 的端口只是容器健康检查和平台路由；实际的 Dashboard 公网地址使用 Argo 域名。若 Northflank 自动注入 `PORT`，入口脚本会优先使用该端口；否则使用 `HTTP_PORT=8080`。
@@ -102,10 +96,11 @@ Northflank 的端口只是容器健康检查和平台路由；实际的 Dashboar
 | `GH_PAT` | 是（启用备份时） | `ghp_...` | GitHub PAT，建议只授予目标仓库权限 |
 | `GH_BRANCH` | 否 | `main` | 备份分支，默认 `main` |
 | `BACKUP_RETENTION` | 否 | `7` | GitHub 中保留的归档数量，默认 7 |
+| `AUTO_RESTORE_ON_START` | 否 | `true` | 本地没有 `sqlite.db` 时，启动前从 GitHub 恢复最新备份 |
 | `LOCAL_AGENT_ENABLED` | 否 | `true` | 默认启用内置本机 Agent |
 | `LOCAL_AGENT_SECRET` | 本机探针需要 | `NZ_CLIENT_SECRET` | V2 “添加服务器”生成的连接密钥 |
-| `LOCAL_AGENT_SERVER` | 否 | `nezha.example.com:443` | 默认使用 `${ARGO_DOMAIN}:443` |
-| `LOCAL_AGENT_TLS` | 否 | `true` | 通过 Argo HTTPS 入口时保持 `true` |
+| `LOCAL_AGENT_SERVER` | 否 | `127.0.0.1:8008` | 内置 Agent 默认直连同容器 Dashboard |
+| `LOCAL_AGENT_TLS` | 否 | `false` | 本机直连 Dashboard 使用明文 h2c，不经过 Argo |
 | `LOCAL_AGENT_DISABLE_COMMAND_EXECUTE` | 否 | `true` | 默认禁止本机 Agent 执行面板下发命令 |
 | `NZ_SITE_NAME` | 否 | `Nezha V2` | 初始站点名称 |
 | `NZ_LANGUAGE` | 否 | `zh_CN` | 初始后台语言 |
@@ -125,7 +120,13 @@ Northflank 的端口只是容器健康检查和平台路由；实际的 Dashboar
 [info] 启动 Cloudflare Tunnel token 模式
 ```
 
-如果尚未填写 `LOCAL_AGENT_SECRET`，日志会出现 warning，但 Dashboard、反代和 Tunnel 仍会正常运行；填入密钥并重启后本机 Agent 才会上线。
+如果尚未填写 `LOCAL_AGENT_SECRET`，日志会出现 warning，但 Dashboard、反代和 Tunnel 仍会正常运行；填入密钥并重启后本机 Agent 才会上线。无持久化卷时，启动日志还应出现：
+
+```text
+[startup-restore] restored nezha-v2-...tar.gz from GitHub before Dashboard startup
+```
+
+如果没有可用备份，日志会明确提示，容器会使用全新的 `admin/admin` 数据库启动。
 
 ### 3. 访问面板
 
@@ -156,6 +157,7 @@ docker compose logs -f nezha-v2-argo
 
 | 时间 | 任务 |
 |---|---|
+| 每次启动 | 当 `data/sqlite.db` 不存在时，从 GitHub 恢复最近备份后再启动 Dashboard |
 | 每日 03:00 | 检查并下载最新 Nezha V2 Dashboard；同步官方脚本，并按需同步本项目脚本 |
 | 每日 04:00 | 在线生成 SQLite 一致性备份，打包 `data`、Tunnel 凭据和本机 Agent 配置，推送 GitHub |
 
@@ -184,20 +186,34 @@ nezha-v2-20260814T040000Z.tar.gz
 - `cloudflared/credentials.json`（JSON 模式时）
 - Tunnel 配置及其它持久化状态
 
+### 启动自动恢复
+
+参考项目采用 GitHub 备份仓库作为无持久化容器的数据源。本项目在启动阶段也会执行同样的恢复逻辑：仅当本地不存在 `data/sqlite.db` 时读取备份仓库，优先使用备份仓库 `README.md` 中记录的归档；如果 README 没有记录，则选择最新的 `nezha-v2-*.tar.gz`。恢复完成后才启动 Dashboard，避免先生成新的 `admin/admin` 数据库。
+
+因此，第一次部署必须先完成一次登录和配置，然后手动执行备份：
+
+```bash
+/opt/nezha/scripts/backup.sh
+```
+
+之后 Northflank 每次因修改环境变量而重新部署时，会自动恢复 GitHub 中最近一次成功备份。备份仓库必须保持私有，且 `GH_PAT` 需要有读写权限。
+
+### 手动恢复
+
 恢复前建议先备份当前状态。进入容器后执行：
 
 ```bash
 /opt/nezha/scripts/restore.sh nezha-v2-20260814T040000Z.tar.gz
 ```
 
-恢复脚本会从 `GH_REPO` 克隆备份仓库，校验文件名和归档中的 `data/` 目录，再覆盖数据。修改 GitHub 备份仓库根目录 `README.md` 不会触发自动恢复；恢复是显式手动操作，避免误操作覆盖在线数据库。
+恢复脚本会从 `GH_REPO` 克隆备份仓库，校验文件名和归档中的 `data/` 目录，再覆盖数据。启动自动恢复只在本地没有 `sqlite.db` 时执行，不会在正常运行期间用旧备份覆盖在线数据库。
 
 如果需要迁移到新的 Northflank 服务：
 
 1. 新服务使用相同的 `GH_REPO`、`GH_PAT`、`ARGO_DOMAIN` 和 Argo 凭据。
-2. 新服务挂载持久化卷并启动一次。
-3. 进入容器执行 `restore.sh`。
-4. 重启服务并检查登录、服务器列表、Tunnel 和本机 Agent。
+2. 不挂载卷也可以直接启动，确认 `AUTO_RESTORE_ON_START=true`。
+3. 查看日志，确认出现 `[startup-restore] restored ...`。
+4. 检查登录、服务器列表、Tunnel 和本机 Agent。
 
 ## 六、排障
 
@@ -220,9 +236,9 @@ curl -fsS http://127.0.0.1:8080/api/v1/setting
 确认：
 
 1. `LOCAL_AGENT_SECRET` 来自 V2“添加服务器”安装命令的 `NZ_CLIENT_SECRET`。
-2. `LOCAL_AGENT_SERVER` 是 `域名:443`，没有 `https://` 前缀。
-3. `LOCAL_AGENT_TLS=true`。
-4. Cloudflare 域名开启 gRPC；如果所在网络对 gRPC 不稳定，先查看 Agent 日志中的连接错误。
+2. `LOCAL_AGENT_SERVER` 应为 `127.0.0.1:8008`，不要填写 Argo 域名。
+3. `LOCAL_AGENT_TLS=false`。
+4. 如果仍不上线，打开 Agent debug 日志并检查容器日志；外部 Agent 走 Argo 时还需要检查 Cloudflare 的 gRPC/反代配置。
 
 ### GitHub 备份失败
 
@@ -231,7 +247,7 @@ curl -fsS http://127.0.0.1:8080/api/v1/setting
 1. `GH_REPO` 为 `owner/repository`，不是仓库网页 URL。
 2. 仓库是私有仓库，PAT 对该仓库有写权限。
 3. `GH_BRANCH` 存在且默认分支名称正确。
-4. Northflank 容器有持久化卷，避免每次重启都重新初始化数据。
+4. 如果没有持久化卷，确认 `AUTO_RESTORE_ON_START=true`，并确认 GitHub 私有仓库中已有 `nezha-v2-*.tar.gz` 归档。
 
 ### 固定 Dashboard 版本
 
@@ -252,6 +268,7 @@ dashboard-runner.sh     Dashboard 崩溃/升级后的自动重启包装器
 caddy/Caddyfile         HTTP、WebSocket、gRPC/h2c 反向代理
 scripts/backup.sh       GitHub 私有仓库备份
 scripts/restore.sh      GitHub 备份恢复
+scripts/restore-on-start.sh 无持久化磁盘时的启动前自动恢复
 scripts/update.sh       Dashboard 每日更新
 scripts/update-scripts.sh 每日同步官方及自定义脚本
 docker-compose.yml      本地 Docker Compose 示例

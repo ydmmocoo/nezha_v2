@@ -13,7 +13,7 @@ ENV TZ=Asia/Shanghai \
     BACKUP_TIME="0 4 * * *" \
     BACKUP_RETENTION=7 \
     LOCAL_AGENT_ENABLED=true \
-    LOCAL_AGENT_TLS=true \
+    LOCAL_AGENT_TLS=false \
     LOCAL_AGENT_DISABLE_COMMAND_EXECUTE=true
 
 RUN apk add --no-cache \

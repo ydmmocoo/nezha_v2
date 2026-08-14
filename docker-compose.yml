@@ -14,10 +14,11 @@ services:
       GH_PAT: ${GH_PAT:-}
       GH_BRANCH: ${GH_BRANCH:-main}
       BACKUP_RETENTION: ${BACKUP_RETENTION:-7}
+      AUTO_RESTORE_ON_START: ${AUTO_RESTORE_ON_START:-true}
       LOCAL_AGENT_SECRET: ${LOCAL_AGENT_SECRET:-}
       LOCAL_AGENT_ENABLED: ${LOCAL_AGENT_ENABLED:-true}
       LOCAL_AGENT_SERVER: ${LOCAL_AGENT_SERVER:-}
-      LOCAL_AGENT_TLS: ${LOCAL_AGENT_TLS:-true}
+      LOCAL_AGENT_TLS: ${LOCAL_AGENT_TLS:-false}
       SELF_UPDATE_REPO: ${SELF_UPDATE_REPO:-}
     volumes:
       - nezha-data:/opt/nezha/data

@@ -37,6 +37,10 @@ if [ -z "${ARGO_TOKEN:-}" ] && [ -z "${ARGO_AUTH:-}" ]; then
     die "ARGO_TOKEN 或 ARGO_AUTH 至少设置一个"
 fi
 
+# Northflank's free filesystem is ephemeral. Restore the last GitHub backup
+# before generating config or starting Dashboard when sqlite.db is absent.
+"${ROOT}/scripts/restore-on-start.sh"
+
 write_if_missing "${DATA_DIR}/config.yaml" \
     "debug: false" \
     "listen_port: ${DASHBOARD_PORT}" \
@@ -57,7 +61,7 @@ cat > "${ROOT}/Caddyfile" <<EOF
 EOF
 
 write_agent_config() {
-    local agent_server="${LOCAL_AGENT_SERVER:-${ARGO_DOMAIN}:443}"
+    local agent_server="${LOCAL_AGENT_SERVER:-127.0.0.1:${DASHBOARD_PORT}}"
     local agent_uuid="${LOCAL_AGENT_UUID:-}"
     if [ -z "${agent_uuid}" ] && [ -s "${STATE_DIR}/local-agent.uuid" ]; then
         agent_uuid="$(cat "${STATE_DIR}/local-agent.uuid")"
@@ -83,7 +87,7 @@ server: "${agent_server}"
 skip_connection_count: false
 skip_procs_count: false
 temperature: false
-tls: ${LOCAL_AGENT_TLS:-true}
+tls: ${LOCAL_AGENT_TLS:-false}
 use_atomgit_to_upgrade: false
 use_gitee_to_upgrade: false
 use_ipv6_country_code: false
@@ -130,11 +134,15 @@ start_agent() {
         echo "[info] LOCAL_AGENT_ENABLED 非 true，跳过本机 Agent"
         return
     fi
-    if [ -z "${LOCAL_AGENT_SECRET:-}" ]; then
-        echo "[warn] 未设置 LOCAL_AGENT_SECRET，本机 Agent 已内置但暂不启动；请在 V2 面板添加服务器后填写该密钥"
+    if [ -z "${LOCAL_AGENT_SECRET:-}" ] && [ ! -s "${DATA_DIR}/agent-config.yml" ]; then
+        echo "[warn] 未设置 LOCAL_AGENT_SECRET，且没有备份恢复的 agent-config.yml；本机 Agent 暂不启动"
         return
     fi
-    write_agent_config
+    if [ -z "${LOCAL_AGENT_SECRET:-}" ]; then
+        echo "[info] 使用 GitHub 备份恢复的本机 Agent 配置"
+    else
+        write_agent_config
+    fi
     "${ROOT}/agent" -c "${DATA_DIR}/agent-config.yml" &
     AGENT_PID=$!
 }
