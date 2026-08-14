@@ -1,8 +1,0 @@
-.git
-.gitignore
-.dockerignore
-data
-*.env
-*.env.*
-README.md~
-_ref
