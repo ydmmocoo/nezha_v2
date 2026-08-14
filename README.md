@@ -1,277 +1,598 @@
-# Argo-Nezha-Service-Container (哪吒面板 **V2**)
+# 哪吒面板 V2 Northflank 部署
 
-使用 Cloudflare Argo 隧道的**哪吒监控面板 V2**（`nezhahq/nezha`）服务端容器。
-只要能联网即可部署，无需公网 IP / 开放端口，适合 PaaS（Northflank、Render、Koyeb、Hugging Face、dashboard.suga.app 等）、LXC / OpenVZ、NAT 机器。
+本项目用于构建哪吒监控 V2 容器，仅支持 `nezhahq/nezha` V2，不兼容 V1、V0 或旧版 `naiba/nezha`。
 
-> **仅兼容哪吒面板 V2，已彻底移除 V0 / V1 兼容代码。**
-> 相比参考项目（fscarmen2 / Kiritocyz / IonRh 的 V0·V1 分支），本镜像：
-> - 只从 `nezhahq/nezha`（V2）下载 Dashboard，不再按 `naiba/nezha` / `nap0o` / `railzen/nezha-zero` 做版本分支；
-> - 使用 V2 **统一端口 8008**（Web + gRPC + WebSocket 共用），不再维护独立的 5555 gRPC 端口；
-> - 移除旧的 `sqlite.db` `servers` 表 hack —— V2 首次启动会自动建库与初始化管理员；
-> - 反代默认仅保留 **Caddy**（h2c 回源 8008），移除 Nginx / grpcwebproxy 兼容分支。
+容器启动时会完成以下工作：
 
----
+- 下载指定版本的哪吒 Dashboard 二进制；
+- 可选下载哪吒 Agent，用于监控面板所在的容器；
+- 生成并修补 `data/config.yaml`；
+- 使用 nginx 将 Web、WebSocket 和 gRPC 转发到 Dashboard 的 `8008` 端口；
+- 可选启用 Cloudflare Tunnel、TSDB 和 GitHub 加密备份。
 
-## 架构
+## 部署前的重要结论
 
+Northflank 部署时请遵循下面三点：
+
+1. 只把容器端口 `80` 配置为公开端口，并将协议设置为 `HTTP/2`；
+2. 将 Northflank 持久卷挂载到 `/app/data`，服务副本数保持为 `1`；
+3. Agent 连接地址使用 Northflank 公网域名的 `443` 端口，例如 `xxx.code.run:443`。
+
+Northflank 会在边缘自动提供 HTTPS，并把请求转发到容器的 `80` 端口。容器内部的 nginx `443` 监听仅用于普通 VPS 场景，在 Northflank 中不要将容器 `443` 配置为公网端口。
+
+## 工作原理
+
+```text
+浏览器 / Agent
+      │ HTTPS / HTTP2 / gRPC
+      ▼
+Northflank 公网域名 :443
+      │ Northflank 边缘终止 TLS
+      ▼
+容器 :80（nginx，HTTP/2）
+      ├── Web / REST / WebSocket  ──► Dashboard :8008
+      └── /proto.NezhaService/    ──► Dashboard :8008（gRPC）
 ```
-哪吒 Agent（被控端）
-      │  gRPC  /proto.NezhaService/*
-      ▼
-Cloudflare Argo Tunnel（公网，自动 TLS）
-      │  https://localhost:443  (noTLSVerify, http2Origin)
-      ▼
-Caddy 反向代理（自签证书，h2c → 127.0.0.1:8008）
-      │
-      ▼
-Nezha Dashboard V2（nezhahq/nezha，监听 8008）
+
+Dashboard、WebSocket 和 gRPC 共用内部 `8008` 端口。Northflank 的公网端口是容器端口的映射，不需要让 Dashboard 直接监听公网端口。
+
+## 版本与兼容性
+
+- 默认 Dashboard 版本：`v2.3.4`；
+- 默认 Agent 版本：`v2.3.3`；
+- 自动更新只跟踪 `v2.x`，不会自动升级到 V3；
+- Dashboard 下载文件名为 `dashboard-linux-${ARCH}.zip`；
+- Agent 下载文件名为 `nezha-agent_linux_${ARCH}.zip`；
+- 支持 `amd64`、`arm64` 和 `s390x` 架构。
+
+官方发布页：
+
+- [哪吒 Dashboard Releases](https://github.com/nezhahq/nezha/releases)
+- [哪吒 Agent Releases](https://github.com/nezhahq/agent/releases)
+
+生产环境建议固定版本，避免上游发布新版本后自动更新导致行为变化：
+
+```text
+DASHBOARD_VERSION=v2.3.4
+AGENT_VERSION=v2.3.3
 ```
 
-V2 的 Web、gRPC、WebSocket 都由 Dashboard 在 **8008** 一个端口处理，Caddy 仅做 TLS 终结与 gRPC 的 h2c 回源，Argo 隧道把公网流量回源到 Caddy 的 443。
+## 目录结构
 
----
+```text
+.
+├── Dockerfile              # 基于 nginx:alpine 构建容器
+├── nginx/
+│   └── nezha.conf          # nginx 反向代理配置
+├── docker-compose.yml      # 本地测试配置
+├── scripts/
+│   ├── start.sh            # 容器入口、初始化、看门狗
+│   ├── renew.sh            # V2 自动更新
+│   ├── backup.sh           # GitHub 加密备份
+│   ├── restore.sh           # GitHub 启动恢复
+│   └── restart.sh           # 手动重启 Dashboard
+└── README.md
+```
 
-## 准备变量
+推送到 GitHub 前，确认 `nginx/` 和 `scripts/` 已经加入 Git。可以执行：
 
-| 变量 | 必填 | 说明 |
-| --- | --- | --- |
-| `GH_USER` | 是 | GitHub 用户名，作为面板管理员（OAuth 登录） |
-| `GH_CLIENTID` | 是 | GitHub OAuth App 的 Client ID |
-| `GH_CLIENTSECRET` | 是 | GitHub OAuth App 的 Client Secret |
-| `ARGO_AUTH` | 是 | Argo 隧道认证：Cloudflare 控制台生成的 **json**（推荐）或 **token** |
-| `ARGO_DOMAIN` | 是 | Argo 隧道绑定的域名（需提前在 Cloudflare 开启 gRPC） |
-
-可选变量见下表。
-
-### 获取 Argo 隧道
-
-- **json（推荐）**：通过 <https://fscarmen.cloudflare.now.cc> 一键生成，或在 Cloudflare Zero Trust 创建隧道后复制 `Tunnel Secret` 完整 JSON。
-- **token**：Cloudflare 控制台手动创建隧道，复制以 `ey` 开头的 token。
-
-> 域名需在 Cloudflare 开启 **gRPC**（Network → gRPC）。
-
-### GitHub OAuth App
-
-<https://github.com/settings/developers/new> 创建应用：
-- Homepage / Callback：`https://<你的ARGO域名>/oauth2/callback`
-- 拿到 Client ID 与 Client Secret。
-
----
+```bash
+git status
+git add Dockerfile docker-compose.yml README.md nginx scripts .dockerignore
+git commit -m "prepare nezha v2 northflank deployment"
+git push
+```
 
 ## 环境变量
 
-| 变量 | 必填 | 默认值 | 说明 |
-| --- | --- | --- | --- |
-| `GH_USER` / `GH_CLIENTID` / `GH_CLIENTSECRET` | 是 | — | GitHub OAuth 管理员登录 |
-| `ARGO_AUTH` / `ARGO_DOMAIN` | 是 | — | Argo 隧道 json 或 token |
-| `DASHBOARD_VERSION` | 否 | 最新 | 固定面板版本，V2 格式如 `v2.3.4` |
-| `LANGUAGE` | 否 | `zh-CN` | 后台语言 |
-| `GH_PAT` / `GH_EMAIL` / `GH_REPO` | 否 | — | GitHub 备份库（私库），三者齐备才启用每日备份 |
-| `GH_BACKUP_USER` | 否 | `=$GH_USER` | 备份库所属 GitHub 用户 |
-| `NZ_AGENTKEY` / `IDU` / `NZ_DOMAIN` | 否 | — | 三者齐备才启用**内置本机探针** |
-| `NO_AUTO_RENEW` | 否 | 未设置 | 设置任意值即关闭每日自动更新/备份同步 |
+### 必填变量
 
-**内置探针说明**：`NZ_AGENTKEY` 是面板管理员账户的 Agent 密钥（登录面板后「个人中心 / 服务器安装命令」可获取），`IDU` 用 `uuidgen` 生成一个唯一 ID，`NZ_DOMAIN` 填 `127.0.0.1:8008`（本机直连，tls=false）或公网域名（如 `example.com:443`，tls=true）。三者缺一则不启动内置探针——此时可在面板「服务器 → 安装命令」添加任意被控端（V2 官方推荐方式）。
+| 变量            | 示例                         | 说明                                                                                                  |
+| ------------- | -------------------------- | --------------------------------------------------------------------------------------------------- |
+| `NZ_AGENTKEY` | `use-a-long-random-secret` | Dashboard 与 Agent 的通信密钥。会写入 `data/config.yaml` 的 `agent_secret_key`，也是容器内置 Agent 的 `client_secret`。 |
 
----
+`NZ_AGENTKEY` 必须使用长随机字符串，不要使用 Compose 文件里的示例值，也不要公开提交到 Git 仓库。
 
-## Docker 镜像
+### 推荐变量
 
-### 构建镜像
+| 变量                  | 示例                           | 说明                                                        |
+| ------------------- | ---------------------------- | --------------------------------------------------------- |
+| `FORCE_AUTH`        | `true`                       | `true` 强制登录；`false` 允许访客查看公开状态页。生产环境建议使用 `true`。          |
+| `NZ_JWTSECRETKEY`   | `another-long-random-secret` | 固定 JWT 签名密钥，避免 Dashboard 自动轮换后用户频繁掉线。                     |
+| `NZ_DASHBOARD_HOST` | `xxx.code.run`               | Dashboard 对外访问域名，不带 `https://`、路径或端口。用于 OAuth2 回调和反向代理场景。 |
+| `DASHBOARD_VERSION` | `v2.3.4`                     | 固定 Dashboard 版本。设置后不会自动更新 Dashboard。                      |
+| `AGENT_VERSION`     | `v2.3.3`                     | 固定容器内置 Agent 版本。设置后不会自动更新 Agent。                          |
 
-```bash
-# 在仓库根目录执行
-docker build -t nezha-v2-argo:latest .
+### 可选变量
+
+| 变量                               | 说明                                                               |
+| -------------------------------- | ---------------------------------------------------------------- |
+| `NZ_DOMAIN`                      | Agent 连接的公网域名。与 `IDU` 同时填写时，容器会启动内置 Agent。只填写域名，不要填写 `https://`。 |
+| `IDU`                            | 面板自监控服务器对应的 UUID。建议使用哪吒面板中该服务器的实际 UUID。                          |
+| `ARGO_AUTH`                      | Cloudflare Tunnel Token。设置后会启动 cloudflared。                      |
+| `NZ_EXTRA_USER_THEME`            | 自定义用户主题 ZIP 下载地址。                                                |
+| `NZ_ENABLE_TSDB`                 | 设置为 `true` 启用 TSDB 历史指标，设置为 `false` 关闭。                          |
+| `NZ_TSDB_DATA_PATH`              | TSDB 路径。Northflank 建议设置为 `/app/data/tsdb`。                       |
+| `NZ_TSDB_RETENTION_DAYS`         | TSDB 保留天数，默认值为脚本配置的值。                                            |
+| `NZ_TSDB_MIN_FREE_DISK_SPACE_GB` | TSDB 最低剩余磁盘空间。                                                   |
+| `NZ_TSDB_MAX_MEMORY_MB`          | TSDB 最大缓存内存。                                                     |
+| `GITHUB_USERNAME`                | GitHub 用户名。备份功能四个变量必须同时填写。                                       |
+| `REPO_NAME`                      | GitHub 专用备份仓库名。建议使用私有仓库。                                         |
+| `GITHUB_TOKEN`                   | 具有目标仓库读写权限的 Token。                                               |
+| `ZIP_PASSWORD`                   | 备份 ZIP 的密码。请保存好，丢失后无法恢复备份。                                       |
+| `TZ`                             | 时区，默认 `Asia/Shanghai`。                                           |
+
+## 使用 Northflank 从 Git 部署
+
+这是推荐方式。Northflank 会从 GitHub 拉取代码、构建 Dockerfile，并运行生成的镜像。
+
+### 1. 准备 Git 仓库
+
+将本目录推送到 GitHub 或 Northflank 支持的 Git 仓库。仓库根目录必须包含：
+
+```text
+Dockerfile
+docker-compose.yml
+nginx/nezha.conf
+scripts/start.sh
 ```
 
-镜像名约定为 `nezha-v2-argo:latest`，内部包含 Debian + supervisor 守护进程、Caddy 反代、以及 `entrypoint.sh` 初始化逻辑。**镜像本身不含面板二进制**——V2 Dashboard（与可选 Agent）在容器首次启动时按需从 GitHub 下载，所以构建很快、体积很小，但运行时需能访问 `github.com`。
+不要把 `data/`、真实密钥或 GitHub Token 提交到仓库。
 
-### 多架构构建（CI 自动）
+### 2. 创建 Northflank 服务
 
-`.github/workflows/Build.yml` 借助 `docker/setup-qemu-action` + `docker/setup-buildx-action`，在 push 到 `main` 时自动构建并推送 `linux/amd64` 与 `linux/arm64` 双架构镜像到容器 registry（GHCR / Docker Hub）。在 GitHub 仓库 `Settings → Secrets` 配置 `DOCKERHUB_USERNAME` / `DOCKERHUB_TOKEN`（或 `GHCR_TOKEN`）后启用。
+1. 登录 Northflank，创建一个 Project；
+2. 添加 Deployment Service；
+3. 选择 **Build from Git**；
+4. 连接包含本项目的 Git 仓库；
+5. 选择分支，例如 `main`；
+6. 构建方式选择 Dockerfile；
+7. Dockerfile 路径填写 `/Dockerfile`；
+8. Build Context 使用仓库根目录；
+9. 创建并等待首次构建。
 
-```bash
-# 本地模拟多架构构建（需 buildx + qemu）
-docker buildx build --platform linux/amd64,linux/arm64 -t nezha-v2-argo:latest . --load
+Dockerfile 不需要 Build Arguments。所有配置都通过运行时环境变量注入。
+
+### 3. 配置公网端口
+
+进入服务的 **Ports & DNS** 页面，手动配置以下端口：
+
+| 项目             | 配置                         |
+| -------------- | -------------------------- |
+| Container port | `80`                       |
+| Protocol       | `HTTP/2`                   |
+| Public         | 开启                         |
+| Domain         | 使用 Northflank 自动域名或绑定自己的域名 |
+
+哪吒 Agent 的连接是 gRPC，因此这里必须选择 `HTTP/2`。普通 HTTP/1.1 端口虽然可以打开网页，但可能导致 Agent 连接失败。
+
+Dockerfile 中声明了 `80` 和 `443` 两个端口。Northflank 可能会自动检测出两个端口，请删除或不要公开容器 `443`，只保留容器 `80` 的 HTTP/2 公网端口。
+
+Northflank 对外会使用 `80/443`，但内部请求会被转发到你配置的容器端口 `80`。因此 Agent 使用：
+
+```text
+https://你的Northflank域名
+Agent server: 你的Northflank域名:443
 ```
 
-### 推送到镜像仓库
+参考：
 
-```bash
-# Docker Hub
-docker tag nezha-v2-argo:latest <用户名>/nezha-v2-argo:latest
-docker push <用户名>/nezha-v2-argo:latest
+- [Northflank 配置端口](https://northflank.com/docs/v1/application/network/configure-ports)
+- [Northflank 网络说明](https://northflank.com/docs/v1/application/network/networking-on-northflank)
 
-# 或 GHCR
-docker tag nezha-v2-argo:latest ghcr.io/<用户名>/nezha-v2-argo:latest
-docker push ghcr.io/<用户名>/nezha-v2-argo:latest
+### 4. 配置持久化磁盘
+
+哪吒 Dashboard 的数据库和配置位于 `/app/data`，至少需要持久化：
+
+```text
+Container mount path: /app/data
 ```
 
-> 标签约定：`latest` 跟随仓库 `main`；如需固定版本可额外打 `vX.Y.Z` 标签。该标签**只标识容器镜像**，与 `DASHBOARD_VERSION`（控制面板版本）解耦。
+建议容量从 `1 GB` 开始，根据监控服务器数量和历史数据量调整。
 
-### 直接拉取运行
+Northflank 持久卷默认是单实例读写模式，因此：
 
-构建并推送后，后续部署可跳过构建步骤，直接 `docker pull` 再 `docker run`（见下方「部署 → Docker Run」）：
+- Service replicas 必须设置为 `1`；
+- 不要启用水平扩容；
+- 不要同时挂载同一个 SQLite 数据卷到多个实例；
+- 重新部署或重启时保留该 Volume。
 
-```bash
-docker pull <用户名>/nezha-v2-argo:latest
+如果启用 TSDB，建议同时设置：
+
+```text
+NZ_ENABLE_TSDB=true
+NZ_TSDB_DATA_PATH=/app/data/tsdb
 ```
 
----
+否则脚本默认使用 `/app/tsdb`，该路径不在 `/app/data` 持久卷内，重建容器后可能丢失 TSDB 历史数据。
 
-## 部署
+参考：[Northflank 持久卷](https://northflank.com/docs/v1/application/databases-and-persistence/add-a-volume)
 
-### 1. Docker Run
+### 5. 配置运行时环境变量
 
-```bash
-docker run -dit \
-  --name nezha_v2 \
-  --restart always \
-  -e GH_USER=<github用户名> \
-  -e GH_CLIENTID=<client id> \
-  -e GH_CLIENTSECRET=<client secret> \
-  -e ARGO_AUTH='<argo json 或 token>' \
-  -e ARGO_DOMAIN=<你的argo域名> \
-  -e DASHBOARD_VERSION=v2.3.4 \
-  -v "$PWD/data:/dashboard/data" \
-  nezha-v2-argo:latest
+在 Northflank 的 **Environment** 或 **Runtime Variables** 页面添加以下变量。
+
+最小可用配置：
+
+```text
+NZ_AGENTKEY=<一段长随机字符串>
+FORCE_AUTH=true
+NZ_DASHBOARD_HOST=<Northflank分配的公网域名>
+DASHBOARD_VERSION=v2.3.4
+AGENT_VERSION=v2.3.3
 ```
 
-### 2. Docker Compose
+示例：
+
+```text
+NZ_AGENTKEY=replace-with-a-long-random-secret
+FORCE_AUTH=true
+NZ_JWTSECRETKEY=replace-with-another-long-random-secret
+NZ_DASHBOARD_HOST=web--nezha--abc123.code.run
+DASHBOARD_VERSION=v2.3.4
+AGENT_VERSION=v2.3.3
+TZ=Asia/Shanghai
+```
+
+其中 `NZ_AGENTKEY` 和 `NZ_JWTSECRETKEY` 应在 Northflank 中标记为 Secret，不要放在公开仓库或 README 中。
+
+如果使用自定义域名，`NZ_DASHBOARD_HOST` 填最终用户访问的域名，例如：
+
+```text
+NZ_DASHBOARD_HOST=nezha.example.com
+```
+
+不要填写：
+
+```text
+https://nezha.example.com/
+```
+
+### 6. 配置健康检查
+
+推荐配置一个 HTTP 健康检查：
+
+```text
+Protocol: HTTP
+Port: 80
+Path: /
+```
+
+首次启动需要下载二进制并生成配置，时间可能比普通 Web 服务更长。建议使用 Startup Probe，或者给健康检查预留至少 120 秒启动时间：
+
+```text
+Initial delay: 120s
+Period: 30s
+Timeout: 10s
+Failure threshold: 6
+```
+
+不要在首次部署时配置过于激进的 Liveness Probe，否则容器可能在下载完成前被反复重启。
+
+参考：[Northflank 健康检查](https://northflank.com/docs/v1/application/observe/configure-health-checks)
+
+### 7. 部署并查看日志
+
+点击 Deploy，打开 Northflank 的 Logs 页面。
+
+正常启动时大致会经历：
+
+1. 检查 `NZ_AGENTKEY`；
+2. 尝试恢复 GitHub 备份（如果配置了备份变量）；
+3. 生成自签证书；
+4. 下载 Dashboard 和可选的 Agent；
+5. 首次运行 Dashboard 生成 `data/config.yaml`；
+6. 写入 `agent_secret_key`、`listen_port`、`force_auth` 等配置；
+7. 启动 Dashboard、nginx 和可选 Agent；
+8. 开始监听容器 `80` 端口。
+
+如果日志出现下载失败，优先检查容器是否可以访问：
+
+```text
+https://github.com
+https://api.github.com
+```
+
+### 8. 首次访问面板
+
+1. 打开 Northflank 分配的公网域名；
+2. 等待初始化页面加载；
+3. 设置管理员账号和密码；
+4. 登录后立即修改默认或临时密码；
+5. 确认面板首页可以正常加载服务器列表和监控数据。
+
+如果页面可以打开但一直转圈，先检查 Northflank 端口是否为 `HTTP/2`，然后检查日志中是否有 gRPC 或 WebSocket 错误。
+
+## 添加被监控服务器
+
+### 推荐方式：使用面板生成安装命令
+
+1. 登录 Dashboard；
+2. 进入服务器管理页面；
+3. 新建服务器；
+4. 选择对应操作系统；
+5. 复制面板生成的 Agent 安装命令；
+6. 在被控服务器上执行命令；
+7. 等待服务器出现在 Dashboard 首页。
+
+V2 的 Agent 连接密钥绑定到用户。使用面板生成命令时，应使用命令里的 `NZ_CLIENT_SECRET`，不要擅自把容器的 `NZ_AGENTKEY` 当成外部服务器的 `client_secret`。
+
+哪吒 Agent 文档：[安装 Agent](https://nezha.wiki/en_US/guide/agent)
+
+### 面板通信地址
+
+在哪吒 Dashboard 的系统设置中，填写 Agent 连接地址：
+
+```text
+你的Northflank域名:443
+```
+
+例如：
+
+```text
+web--nezha--abc123.code.run:443
+```
+
+如果使用自定义域名：
+
+```text
+nezha.example.com:443
+```
+
+不要在这里填写容器内部的 `8008`，也不要填写 Northflank 的内部服务名。
+
+## 配置容器自监控
+
+如果希望哪吒面板同时监控自己所在的 Northflank 容器，可以设置：
+
+```text
+NZ_DOMAIN=<Northflank公网域名>
+IDU=<面板中自监控服务器的UUID>
+```
+
+例如：
+
+```text
+NZ_DOMAIN=web--nezha--abc123.code.run
+IDU=11111111-2222-3333-4444-555555555555
+```
+
+两个变量必须同时填写。脚本会在容器内生成 `/app/config.yml`，并启动 `nezha-agent` 连接：
+
+```text
+${NZ_DOMAIN}:443
+```
+
+自监控 Agent 使用 `NZ_AGENTKEY` 作为 `client_secret`。如果 Agent 连接不上，依次检查：
+
+- `NZ_DOMAIN` 是否只包含域名；
+- Northflank 容器端口 `80` 是否配置为 HTTP/2；
+- `IDU` 是否对应 Dashboard 中的服务器 UUID；
+- Dashboard 的 `agent_secret_key` 是否已经写入；
+- Northflank 日志中是否出现 Agent 认证失败。
+
+## 使用 Cloudflare Tunnel（可选）
+
+如果不希望使用 Northflank 公网域名作为 Agent 地址，可以使用 Cloudflare Tunnel。
+
+1. 在 Cloudflare Zero Trust 创建 Tunnel；
+2. 创建 Public Hostname，例如 `nezha.example.com`；
+3. 将 Public Hostname 的 Service 指向：
+   ```text
+   http://localhost:80
+   ```
+4. 确认 Cloudflare Tunnel 开启 HTTP/2 或 gRPC 支持；
+5. 将 Tunnel Token 写入 Northflank 环境变量：
+   ```text
+   ARGO_AUTH=<Cloudflare Tunnel Token>
+   ```
+6. 将 Agent 域名设置为：
+   ```text
+   NZ_DOMAIN=nezha.example.com
+   ```
+7. 如果需要容器自监控，再同时填写 `IDU`。
+
+使用 Tunnel 时，Northflank 的 `80/HTTP2` 公网端口仍建议保留，便于访问面板、查看健康状态和排查问题。
+
+## 备份与恢复
+
+Northflank 持久卷可以保存正常重启和重新部署的数据，但生产环境仍建议启用异地备份。
+
+同时设置以下四个变量才会启用 GitHub 备份和启动恢复：
+
+```text
+GITHUB_USERNAME=<GitHub用户名>
+REPO_NAME=<专用私有仓库名>
+GITHUB_TOKEN=<具有仓库读写权限的Token>
+ZIP_PASSWORD=<备份压缩包密码>
+```
+
+备份内容包括：
+
+- `/app/data`；
+- Dashboard 配置；
+- SQLite 数据库；
+- 必要的 Agent 配置。
+
+脚本会在容器运行期间定期检查备份状态，并按 Asia/Shanghai 时区执行每日备份逻辑。备份仓库建议使用专用私有仓库，不要与源代码仓库混用。
+
+注意：
+
+- `GITHUB_TOKEN` 不要提交到 Git；
+- `ZIP_PASSWORD` 丢失后无法解密备份；
+- GitHub 仓库被删除或 Token 失效时，恢复功能会跳过并继续启动；
+- `/app/data` 持久卷和 GitHub 备份最好同时保留。
+
+## 升级与回滚
+
+### 固定版本升级
+
+修改 Northflank 环境变量：
+
+```text
+DASHBOARD_VERSION=v2.3.4
+AGENT_VERSION=v2.3.3
+```
+
+然后触发 Redeploy。只要 `/app/data` 持久卷没有被删除，Dashboard 数据不会因为重新构建镜像而丢失。
+
+### 使用 V2 自动更新
+
+如果不设置 `DASHBOARD_VERSION`，脚本会查询哪吒仓库的最新 `v2.x` 标签，并在运行期间执行更新检查。
+
+生产环境更建议固定版本，确认新版本稳定后再手动修改环境变量并重新部署。
+
+### 回滚
+
+1. 将 `DASHBOARD_VERSION` 改回之前的版本；
+2. 将 `AGENT_VERSION` 改回匹配的 Agent 版本；
+3. 保留原有 `/app/data` Volume；
+4. 重新部署；
+5. 如果数据库已经发生不可逆迁移，从 GitHub 备份恢复数据。
+
+## 故障排查
+
+### 1. Northflank 构建失败
+
+检查：
+
+- 构建上下文是否为仓库根目录；
+- Dockerfile 路径是否为 `/Dockerfile`；
+- `nginx/nezha.conf` 和 `scripts/start.sh` 是否已经提交到 Git；
+- Northflank 构建节点是否可以访问 Docker Hub 和 Alpine 软件仓库。
+
+### 2. 容器启动后反复重启
+
+优先查看日志中的第一条 `ERROR`。常见原因：
+
+- 没有设置 `NZ_AGENTKEY`；
+- GitHub 下载失败；
+- Dockerfile 架构和运行节点不匹配；
+- 健康检查启动时间过短；
+- 持久卷权限或挂载路径错误。
+
+### 3. 网页打不开
+
+检查：
+
+- Northflank 是否配置了容器端口 `80`；
+- 公网协议是否为 HTTP/2；
+- 是否错误地只配置了容器端口 `443`；
+- nginx 是否已经启动；
+- 健康检查是否误判容器未就绪。
+
+### 4. 网页能打开，但 Agent 不上线
+
+检查：
+
+- Northflank 公网端口是否为 HTTP/2；
+- Agent 地址是否为 `域名:443`；
+- 是否使用了面板生成命令中的 `NZ_CLIENT_SECRET`；
+- 自监控场景的 `NZ_DOMAIN` 是否填写了正确域名；
+- 是否把 `https://` 或路径错误地写入 `NZ_DOMAIN`；
+- 是否将容器 `443` 错误地作为 Northflank 后端端口。
+
+### 5. 页面显示“后端 API 无法访问”或一直转圈
+
+哪吒实时数据使用 WebSocket，Agent 使用 gRPC。检查 nginx 反代路径：
+
+```text
+/proto.NezhaService/  -> gRPC -> 127.0.0.1:8008
+/api/v1/ws/           -> WebSocket -> 127.0.0.1:8008
+/                    -> HTTP -> 127.0.0.1:8008
+```
+
+Northflank 端口类型配置错误时，通常网页仍可能打开，但 gRPC 或 WebSocket 会失败。
+
+### 6. 重启后数据丢失
+
+检查：
+
+- Volume 是否挂载到 `/app/data`；
+- 是否误挂载到 `/app` 或 `/dashboard/data`；
+- 是否删除了原 Volume；
+- 是否启用了多个副本；
+- TSDB 是否写入了未持久化的 `/app/tsdb`。
+
+### 7. 升级后频繁掉线
+
+设置固定 JWT 密钥：
+
+```text
+NZ_JWTSECRETKEY=<固定的长随机字符串>
+```
+
+修改后重新部署一次，之后不要随意更换该值。更换 JWT 密钥会使已有登录会话失效。
+
+## 本地 Docker 测试
+
+本地测试使用 `docker-compose.yml`：
 
 ```bash
+docker compose build
 docker compose up -d
+docker compose logs -f nezha-v2
 ```
-（变量写在 `.env` 或 shell 环境中，见 `docker-compose.yml` 注释。）
 
-### 3. PaaS（Northflank / dashboard.suga.app / Render / Koyeb）
+默认访问地址：
 
-> **不要**在「Deploy from image」里直接填 `nezha-v2-argo:latest` —— 这只是本地/未推送的镜像标签，PaaS 拉不到会报“无法获取”。必须二选一：
-> - **A. 从源码构建（推荐）**：选「Build from a Git Repository」，连接本 GitHub 仓库，Build Method 选 Dockerfile（路径 `/Dockerfile`）。Northflank 自动 build 并托管镜像，无需手动 push。
-> - **B. 推送到 registry**：先把镜像 push 到 Docker Hub / GHCR / 平台自带 registry，再填**完整地址**（如 `docker.io/<用户名>/nezha-v2-argo:latest` 或 `ghcr.io/<用户名>/nezha-v2-argo:latest`）。`.github/workflows/Build.yml` 会在 push 到 main 时自动构建推送（需配 `DOCKERHUB_*` 或 `GHCR_TOKEN` secrets）。
+```text
+http://localhost:8080
+```
 
-- 在平台的环境变量面板填入上述 `GH_*` / `ARGO_*` 必填项。
-- **Build arguments 留空**（Dockerfile 无任何 `ARG`，所有配置都在运行时通过 Runtime variables 注入，不在 build 阶段）。
-- **Runtime variables** 填法见上方「环境变量」表：`GH_USER` / `GH_CLIENTID` / `GH_CLIENTSECRET` / `ARGO_AUTH` / `ARGO_DOMAIN` 为必填；`GH_CLIENTSECRET` / `ARGO_AUTH` / `GH_PAT` / `NZ_AGENTKEY` 建议标为 Secret。`ARCH` / `CADDY_VER` / `DASH_VER_TAG` 为脚本内部自动计算，切勿手动填。
-- **务必配置 `GH_PAT` + `GH_REPO` + `GH_EMAIL` 备份**：PaaS 文件系统是临时性的，重启会丢失 `/dashboard/data`，靠 GitHub 备份恢复。
-- 平台一般无需映射端口（Argo 隧道出站 443 即可）。
+本地 Compose 会把：
 
----
+```text
+宿主机 ./data  -> 容器 /app/data
+宿主机 8080    -> 容器 80
+```
 
-## 客户端接入（被控端）
-
-在面板「服务器 → 安装命令」复制对应系统的命令，在被控机执行即可。V2 Agent 连接地址为你的 Argo 域名（如 `example.com:443`，tls=true）。
-
-手动示例（Linux）：
+启动前请将 Compose 中的 `NZ_AGENTKEY` 替换为真实随机值。停止服务：
 
 ```bash
-curl -L https://raw.githubusercontent.com/nezhahq/scripts/main/agent/install.sh -o agent.sh && \
-chmod +x agent.sh && \
-env NZ_SERVER=example.com:443 NZ_TLS=true NZ_CLIENT_SECRET=<密钥> NZ_UUID=<uuid> ./agent.sh
+docker compose down
 ```
 
----
+## 参考文档
 
-## 备份 / 还原 / 更新
-
-配置 `GH_PAT`/`GH_REPO`/`GH_EMAIL` 后：
-
-- **每日 04:00（北京时间）自动备份** `/dashboard/data` 到 GitHub 私库；
-- **每日 03:30 自动检测并更新** Dashboard 到最新 V2（保留数据）；
-- 手动备份：`bash /dashboard/backup.sh`
-- 手动还原：`bash /dashboard/restore.sh`（还原最新）或 `bash /dashboard/restore.sh dashboard-xxxx.tar.gz`
-- 手动更新面板：`bash /dashboard/renew.sh`
-
----
-
-## 排错
-
-**`nezha` 进程反复 `exit status 1`、supervisor 报 `too many start retries`**
-几乎都是 `data/config.yaml` 不符合 V2 schema 导致。V2 面板**只认以下 6 个字段**（全小写）：
-
-```yaml
-debug: false
-listen_port: 8008
-language: zh-CN
-site_name: "Nezha Probe"
-install_host: <你的ARGO域名>
-tls: false
-```
-
-- 切勿使用 V0/V1 的 `HTTPPort` / `GRPCPort` / `Oauth2` / `site` 字段——V2 不识别，且 `listen_port` 缺省为 `0`，面板绑定端口 0 失败直接退出。
-- **OAuth（GitHub 登录）不是写在 config.yaml 里**，而是由容器通过 `OAUTH2_*` 环境变量注入（`OAUTH2_TYPE` / `OAUTH2_ADMIN` / `OAUTH2_CLIENTID` / `OAUTH2_CLIENTSECRET` / `OAUTH2_ENDPOINT`），值来自你填的 `GH_*` 变量。
-- 若仍异常，进容器看面板真实报错：`docker exec -it <容器> tail -f /dashboard/data/../*.log` 或检查 supervisor 中 `nezha` 的 stdout（本镜像已将其输出到容器 stdout，部署平台日志即可见）。
-
-**页面能打开，但提示「后端 API 无法访问 / 无法加载监控数据」，控制台报 `Unexpected token '<', "<!DOCTYPE>"... is not valid JSON`**
-
-根因：哪吒 V2 的**实时监控数据走 WebSocket**（`/api/v1/ws/server`）。若反代把 WebSocket 升级请求用 `h2c`（HTTP/2 明文）传输转发，Cloudflare/Argo 回源会得到 **502**，前端拿不到数据并连锁命中 Cloudflare 的 HTML 错误页，被当成 JSON 解析。
-
-验证：`curl -i -H "Connection: Upgrade" -H "Upgrade: websocket" https://<你的域名>/api/v1/ws/server` 若返回 `502 Bad Gateway` 即为此问题。
-
-修复：反代必须**按路径分流**——仅 gRPC 路径 `/proto.NezhaService/*` 用 `h2c`（HTTP/2），Web/REST API/WebSocket 一律走 **HTTP/1.1**（支持 Upgrade）。本镜像 `entrypoint.sh` 已默认如此生成 Caddyfile；若你曾手改过 Caddyfile，请确认包含：
-
-```caddyfile
-reverse_proxy /proto.NezhaService/* localhost:8008 {
-    transport http { versions h2c }
-}
-reverse_proxy localhost:8008
-```
-
-> 附带提醒：SPA 会从 `fastly.jsdelivr.net` 加载图标/字体 CSS，国内网络常被墙会变慢或加载不全（仅影响样式，不影响数据）。如需彻底离线可把 `index.html` 里的 cdn 引用改为自托管。
-
-**Caddy 反复 `exit status 1`、`gave up: caddy entered FATAL state`（nezha 进程却正常）**
-
-根因：Caddy `reverse_proxy` 的 `transport http` 里 **`versions` 合法值只有 `1.1` / `2` / `h2c` / `3`，没有 `h1`**。若误写成 `versions h1`，Caddy 在 provision 阶段直接报 `unsupported HTTP version: h1` 并 `exit 1`；而面板进程本身没问题，所以日志里只有 caddy 在死循环重启。
-
-> 注意 supervisor 里 `caddy` 的 stdout/stderr 默认指向 `/dev/null`，真实报错被吞。本镜像已改为输出到容器 stdout，部署平台日志即可看到 `unsupported HTTP version` 之类的具体错误。
-
-修复：gRPC 路径用 `transport http { versions h2c }`；其余 Web/REST/WebSocket 走默认 HTTP/1.1（**直接写 `reverse_proxy localhost:8008`，不要加 transport 块**，默认即 1.1，原生支持 WebSocket Upgrade）。本镜像 `entrypoint.sh` 已用此写法并通过 `caddy validate` 校验（`Valid configuration`）。
-
-> 顺带：首版曾写成 `versions h2c 2`（`h2c` 与 `2` 都合法，故能跑）；切勿画蛇添足改成 `h1`。
-
-**修改密码提示「意外错误」（`POST /api/v1/profile` 返回 200 但改密失败）**
-
-根因：哪吒 V2 的改密码接口 `updateProfile` **永远要求先校验「原密码」**（`bcrypt.CompareHashAndPassword(user.Password, 原密码)`）。当账号是**纯 GitHub OAuth 登录**创建时，账号没有本地密码（`user.Password` 为空），任何「原密码」都无法匹配 → 后端返回 `"incorrect password"`。该错误走 HTTP 200 + JSON body，前端统一弹「意外错误」。这不是网络/容器问题（日志里所有 `/api/v1/*` 都是 200、WebSocket 也正常）。
-
-✅ 正解（无需改代码，立即可用）：容器首次启动、用户表为空时，哪吒会**自动创建一个本地管理员 `admin` / `admin`**（密码即字符串 `admin` 的 bcrypt 哈希）。这个账号与你的 GitHub OAuth 账号**相互独立、且自带本地密码**。请这样操作：
-
-1. 在登录页用**账号密码**方式登录（用户名 `admin`，密码 `admin`）；
-2. 进入「个人中心 / 修改密码」，原密码填 `admin`，设置新密码 → 即可成功；
-3. 之后用新密码或 GitHub OAuth 都能登录 `admin` 这个管理员账号。
-
-⚠️ 为什么不能直接给 GitHub 账号改密码：OAuth 账号在 nezha 里设计上就没有本地密码字段，`updateProfile` 又强制校验原密码，因此 Web 表单无法为它设置密码。这是正常现象——直接用上面那个本地 `admin` 账号做密码登录即可，GitHub OAuth 仅作为另一种登录方式。
-
-> 若想要一个“自定义用户名 + 密码”的本地管理员：登录 `admin` 后进入「系统设置 → 用户管理」**新建**一个带密码的本地管理员账号即可（注意是“新建”，不是“编辑自己”——编辑自己仍走原密码校验）。
-
-> 注：本镜像每次重建容器会因 `jwt_secret_key` 重新生成而使旧登录会话失效（日志 `generated new jwt_secret_key`）。已部署后建议通过 GitHub 私库备份 `/dashboard/data`（`GH_PAT`+`GH_REPO`+`GH_EMAIL`）以便恢复；或在环境变量注入固定 `NZ_JWTSECRETKEY` 避免每次轮换。
-
----
-
-## 与参考项目的差异（为何是 V2-only）
-
-参考仓库（fscarmen2 / Kiritocyz / IonRh）的 `init.sh` 内含大量 V0/V1 兼容分支：
-`naiba/nezha`（<0.20.13）、`nap0o/nezha-dashboard`（=0.20.13）、`railzen/nezha-zero`（>0.20.13）三源切换，
-以及 `sqlite.db` 的 `servers` 表预置密钥。本镜像**全部删除**，仅保留 `nezhahq/nezha`（V2）单一来源，
-并使用 V2 的统一端口与自动建库机制，逻辑更干净、维护更省心。
-
----
-
-## 文件结构
-
-```
-.
-├── Dockerfile            # debian + supervisor 基础镜像
-├── entrypoint.sh         # 核心初始化（V2 only）：下载/配置/守护
-├── backup.sh             # 备份到 GitHub 私库
-├── restore.sh            # 从 GitHub 私库还原
-├── renew.sh              # 更新 Dashboard 二进制
-├── docker-compose.yml    # 本地/VPS 部署示例
-└── .github/workflows/Build.yml  # 多架构镜像构建推送
-```
-
----
+- [Northflank 配置端口](https://northflank.com/docs/v1/application/network/configure-ports)
+- [Northflank 网络](https://northflank.com/docs/v1/application/network/networking-on-northflank)
+- [Northflank 持久卷](https://northflank.com/docs/v1/application/databases-and-persistence/add-a-volume)
+- [Northflank 健康检查](https://northflank.com/docs/v1/application/observe/configure-health-checks)
+- [哪吒 Dashboard 配置](https://nezha.wiki/en_US/configuration/dashboard.html)
+- [哪吒 Agent 安装](https://nezha.wiki/en_US/guide/agent)
+- [哪吒 Dashboard Releases](https://github.com/nezhahq/nezha/releases)
+- [哪吒 Agent Releases](https://github.com/nezhahq/agent/releases)
 
 ## 免责声明
 
-本项目仅供学习交流，非盈利目的。使用本程序须遵守服务器所在地及用户所在国家/地区的法律法规。
-面板含高权限，请务必修改默认密码、使用强 OAuth 配置，并将备份库设为私有。
+本项目仅供学习和部署测试使用。哪吒面板包含监控、命令和文件传输等高权限功能，请使用强密码、私有备份仓库和最小权限 Token，并遵守服务器所在地及用户所在地的法律法规。
+
+## 许可证
+
+本项目采用 MIT 许可证。完整的许可证文本如下：
+
+```text
+MIT License
+
+Copyright (c) 2026 ydmmocoo
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+```
+
