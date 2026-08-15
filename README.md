@@ -22,7 +22,9 @@ Cloudflare Edge
       ▼
 cloudflared Tunnel
       ▼
-Caddy :8080  ── HTTP/2 h2c / WebSocket ──▶ Dashboard :8008
+Caddy :8080  ── HTTP / WebSocket ───────────────▶ Dashboard :8008
+      │
+      └── TLS/HTTP2 :443 ── h2c ─────────────────▶ Dashboard :8008
                                                   │
                                                   └── SQLite / data
 ```
@@ -36,15 +38,51 @@ Northflank 不需要额外公网入口。免费实例没有持久化卷时，容
 1. 将域名托管到 Cloudflare。
 2. 准备一个单独的子域名，例如 `nezha.example.com`。
 3. 在 Cloudflare Zero Trust → Networks → Tunnels 创建 Tunnel。
-4. 为该 Tunnel 添加 Public Hostname：
-   - Hostname：`nezha.example.com`
-   - Service Type：`HTTP`
-   - URL：任意可用的本地占位地址即可，例如 `http://127.0.0.1:8080`
-5. 记录 Tunnel Token，或者下载 Tunnel JSON 凭据。
+4. 准备 Argo 认证。推荐使用 Tunnel JSON，填写 `ARGO_AUTH`；也可以使用 Tunnel Token，填写 `ARGO_TOKEN`。
 
-优先使用 `ARGO_TOKEN`。如果使用 JSON，请把 JSON 原文完整放入 `ARGO_AUTH`，不要额外套 Markdown 代码块。JSON 至少需要包含 `TunnelID`、`AccountTag`、`TunnelSecret` 等 Cloudflare 凭据字段。
+#### 推荐：ARGO_AUTH JSON 模式
 
-如果要通过 Cloudflare CDN 传输 Agent 的 gRPC 流量，请在 Cloudflare 域名的 Network 设置中启用 gRPC。使用 HTTPS 入口时，Agent 的 `tls` 应为 `true`。
+将完整 JSON 凭据放入 `ARGO_AUTH`，将 `ARGO_TOKEN` 留空。容器会自动生成以下两条路由：
+
+```text
+/proto.NezhaService/*  →  https://127.0.0.1:443
+其他请求              →  http://127.0.0.1:8080
+```
+
+gRPC 路由会启用 `http2Origin: true` 和 `noTLSVerify: true`，因为容器内 `443` 使用自动生成的自签名证书。
+
+#### ARGO_TOKEN 模式
+
+将 `ARGO_TOKEN` 填入，`ARGO_AUTH` 留空。Token 模式不能从容器内自动写入 Cloudflare 控制台的 Public Hostname 路由，需要手动配置两条规则：
+
+第一条必须排在普通 HTTP 规则之前：
+
+```text
+Hostname：nezha.example.com
+Path：/proto.NezhaService/*
+Service：HTTPS
+URL：https://127.0.0.1:443
+```
+
+在 Origin Parameters 中启用：
+
+```text
+HTTP/2 origin：开启
+No TLS Verify：开启
+```
+
+第二条用于访问面板：
+
+```text
+Hostname：nezha.example.com
+Path：留空
+Service：HTTP
+URL：http://127.0.0.1:8080
+```
+
+Token 模式的 Tunnel 启动时会使用 `protocol: http2`。如果只配置普通 HTTP 规则，面板可以打开，但远程 Agent 不会有监控数据。
+
+Cloudflare 的 gRPC 能力和账号配置可能存在差异；如远程 Agent 仍无法连接，需要确认 Cloudflare 控制台已启用 gRPC，并检查 Agent 对接入口是否真正协商 HTTP/2。Cloudflare 当前文档对 Public Hostname 的 gRPC 支持仍有额外限制。[Cloudflare gRPC 文档](https://developers.cloudflare.com/network/grpc-connections/)
 
 ### 2. 准备 GitHub 备份仓库
 
@@ -66,6 +104,20 @@ V2 的 `client_secret` 与用户绑定，不能使用 V0 时代的全局 `agent_
 
 容器会使用这个密钥启动内置 Agent。由于 Agent 与 Dashboard 在同一个容器内，默认直接连接 `127.0.0.1:8008`，不经过 Argo 公网域名；这样可以避免 Cloudflare Public Hostname 对 gRPC 的限制。V2 官方文档也说明，Agent 连接密钥应从服务器页面生成的安装命令中取得。[Agent 配置](https://nezha.wiki/configuration/agent.html) 和 [服务器管理](https://nezha.wiki/guide/servers.html)。
 
+### 4. 接入其他服务器
+
+其他服务器必须使用独立 Agent，不要填写 Northflank 的 `LOCAL_AGENT_SECRET`。在管理后台进入“服务器”页面，点击“安装命令”，选择远程服务器的系统并复制命令。
+
+本项目按参考项目使用 `443 + TLS + gRPC` 作为远程 Agent 对接入口。安装命令应生成类似配置：
+
+```yaml
+server: "nezha.example.com:443"
+tls: true
+client_secret: "当前用户的 NZ_CLIENT_SECRET"
+```
+
+如果设置了 `AGENT_INSTALL_HOST`，安装命令会使用该值。它必须是远程服务器可以访问、并且支持 gRPC/HTTP2 的地址。`8008` 只用于容器内部 Dashboard，`8080` 只用于普通 HTTP 反代，二者都不应填写给远程 Agent。
+
 ## 二、Northflank 部署
 
 下面以将本仓库直接部署到 Northflank 为例。
@@ -77,7 +129,7 @@ V2 的 `client_secret` 与用户绑定，不能使用 V0 时代的全局 `agent_
 3. 选择 **Add service → Build service**。
 4. 连接本项目 GitHub 仓库，分支选择 `main`。
 5. Build method 选择 **Dockerfile**，路径填写 `/Dockerfile`。
-6. Service port 添加 `8080`，协议选择 HTTP。
+6. Service port 添加 `8080`，协议选择 HTTP。容器内部的 gRPC TLS 端口是 `443`，由 Argo Tunnel 连接，不需要在 Northflank 额外公开 `443`。
 7. 持久化卷是可选的。免费实例无法挂载卷时，必须配置 GitHub 备份，并保持 `AUTO_RESTORE_ON_START=true`；如果可以使用卷，仍建议挂载到 `/opt/nezha/data` 以减少恢复等待时间。
 8. CPU 建议至少 0.25 vCPU，内存建议至少 512 MiB。
 
@@ -90,13 +142,16 @@ Northflank 的端口只是容器健康检查和平台路由；实际的 Dashboar
 | 变量 | 必填 | 示例 | 说明 |
 |---|---:|---|---|
 | `ARGO_DOMAIN` | 是 | `nezha.example.com` | Cloudflare Tunnel 的公网 Hostname，不要带 `https://` |
-| `ARGO_TOKEN` | 与 JSON 二选一 | `eyJh...` | 推荐，Cloudflare Tunnel Token |
-| `ARGO_AUTH` | 与 Token 二选一 | `{ "AccountTag": ... }` | JSON 凭据原文 |
+| `ARGO_TOKEN` | 与 JSON 二选一 | `eyJh...` | Token 模式；需要在 Cloudflare 手动配置 gRPC 路由 |
+| `ARGO_AUTH` | 与 Token 二选一 | `{ "AccountTag": ... }` | 推荐的 JSON 凭据模式，自动生成 gRPC 路由 |
 | `GH_REPO` | 是（启用备份时） | `user/nezha-backup` | GitHub 私有备份仓库 |
 | `GH_PAT` | 是（启用备份时） | `ghp_...` | GitHub PAT，建议只授予目标仓库权限 |
 | `GH_BRANCH` | 否 | `main` | 备份分支，默认 `main` |
 | `BACKUP_RETENTION` | 否 | `7` | GitHub 中保留的归档数量，默认 7 |
 | `AUTO_RESTORE_ON_START` | 否 | `true` | 本地没有 `sqlite.db` 时，启动前从 GitHub 恢复最新备份 |
+| `GRPC_TLS_PORT` | 否 | `443` | 容器内 TLS/HTTP2 gRPC 入口端口 |
+| `AGENT_INSTALL_HOST` | 否 | `nezha.example.com:443` | 生成远程 Agent 安装命令时使用的对接地址 |
+| `AGENT_INSTALL_TLS` | 否 | `true` | 生成远程 Agent 安装命令时是否启用 TLS |
 | `LOCAL_AGENT_ENABLED` | 否 | `true` | 默认启用内置本机 Agent |
 | `LOCAL_AGENT_SECRET` | 本机探针需要 | `NZ_CLIENT_SECRET` | V2 “添加服务器”生成的连接密钥 |
 | `LOCAL_AGENT_SERVER` | 否 | `127.0.0.1:8008` | 内置 Agent 默认直连同容器 Dashboard |
@@ -149,7 +204,7 @@ docker compose up -d --build
 docker compose logs -f nezha-v2-argo
 ```
 
-如果使用 JSON 凭据，将 `ARGO_TOKEN` 留空并填入 `ARGO_AUTH`。数据保存在 Docker volume `nezha-data`。
+如果使用 JSON 凭据，将 `ARGO_TOKEN` 留空并填入 `ARGO_AUTH`。数据保存在 Docker volume `nezha-data`。Compose 模式会同时启动内部 `443` gRPC TLS 入口。
 
 ## 四、自动任务说明
 
@@ -229,7 +284,7 @@ curl -fsS http://127.0.0.1:8080/api/v1/setting
 
 ### Tunnel 在线但域名 502
 
-确认 Cloudflare Public Hostname 的 URL 与容器内部一致，且入口脚本日志没有 `Caddy` 或 Dashboard 退出信息。Caddy 对 gRPC `Content-Type: application/grpc` 使用 h2c 回源，普通页面和 WebSocket 使用常规 HTTP 反代。
+确认 Cloudflare Public Hostname 的 URL 与容器内部一致，且入口脚本日志没有 `Caddy` 或 Dashboard 退出信息。普通页面和 WebSocket 通过 `:8080` 反代；Agent gRPC 通过容器内 `:443` 的 TLS/HTTP2 入口，再以 h2c 转发到 Dashboard `:8008`。
 
 ### 本机 Agent 不上线
 

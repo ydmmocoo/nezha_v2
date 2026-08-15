@@ -17,7 +17,7 @@ ENV TZ=Asia/Shanghai \
     LOCAL_AGENT_DISABLE_COMMAND_EXECUTE=true
 
 RUN apk add --no-cache \
-        bash ca-certificates curl git gzip jq sqlite tar tzdata unzip util-linux \
+        bash ca-certificates curl git gzip jq openssl sqlite tar tzdata unzip util-linux \
     && mkdir -p /opt/nezha/data /opt/nezha/scripts /opt/nezha/logs /opt/nezha/cloudflared \
     && ln -snf "/usr/share/zoneinfo/${TZ}" /etc/localtime \
     && echo "${TZ}" > /etc/timezone
@@ -54,7 +54,7 @@ RUN chmod 0755 /opt/nezha/entrypoint.sh /opt/nezha/dashboard-runner.sh /opt/nezh
     && touch /opt/nezha/data/.keep
 
 WORKDIR /opt/nezha
-EXPOSE 8080
+EXPOSE 8080 443
 VOLUME ["/opt/nezha/data"]
 
 HEALTHCHECK --interval=30s --timeout=5s --start-period=30s --retries=3 \

@@ -8,7 +8,10 @@ CF_DIR="${ROOT}/cloudflared"
 LOG_DIR="${ROOT}/logs"
 DASHBOARD_PORT="${DASHBOARD_PORT:-8008}"
 HTTP_PORT="${PORT:-${HTTP_PORT:-8080}}"
+GRPC_TLS_PORT="${GRPC_TLS_PORT:-443}"
 ARGO_DOMAIN="${ARGO_DOMAIN:-}"
+AGENT_INSTALL_HOST="${AGENT_INSTALL_HOST:-${ARGO_DOMAIN}:443}"
+AGENT_INSTALL_TLS="${AGENT_INSTALL_TLS:-true}"
 
 mkdir -p "${DATA_DIR}" "${STATE_DIR}" "${CF_DIR}" "${LOG_DIR}"
 ln -snf "/usr/share/zoneinfo/${TZ:-Asia/Shanghai}" /etc/localtime
@@ -46,17 +49,35 @@ write_if_missing "${DATA_DIR}/config.yaml" \
     "listen_port: ${DASHBOARD_PORT}" \
     "language: ${NZ_LANGUAGE:-zh_CN}" \
     "site_name: \"${NZ_SITE_NAME:-Nezha V2}\"" \
-    "install_host: \"${ARGO_DOMAIN}:443\"" \
-    "tls: true" \
+    "install_host: \"${AGENT_INSTALL_HOST}\"" \
+    "tls: ${AGENT_INSTALL_TLS}" \
     "reserved_hosts: \"${ARGO_DOMAIN}\""
+
+TLS_DIR="${ROOT}/tls"
+mkdir -p "${TLS_DIR}"
+if [ ! -s "${TLS_DIR}/grpc.pem" ] || [ ! -s "${TLS_DIR}/grpc.key" ]; then
+    echo "[info] 生成 gRPC TLS 证书"
+    openssl req -x509 -nodes -newkey rsa:2048 -days 36500 \
+        -subj "/CN=${ARGO_DOMAIN}" \
+        -keyout "${TLS_DIR}/grpc.key" \
+        -out "${TLS_DIR}/grpc.pem" >/dev/null 2>&1
+fi
 
 cat > "${ROOT}/Caddyfile" <<EOF
 :${HTTP_PORT} {
     encode gzip
 
-    @grpc header Content-Type application/grpc*
-    reverse_proxy @grpc h2c://127.0.0.1:${DASHBOARD_PORT}
     reverse_proxy 127.0.0.1:${DASHBOARD_PORT}
+}
+
+:${GRPC_TLS_PORT} {
+    tls ${TLS_DIR}/grpc.pem ${TLS_DIR}/grpc.key
+    reverse_proxy {
+        to 127.0.0.1:${DASHBOARD_PORT}
+        transport http {
+            versions h2c 2
+        }
+    }
 }
 EOF
 
@@ -108,7 +129,7 @@ start_proxy() {
 start_tunnel() {
     if [ -n "${ARGO_TOKEN:-}" ]; then
         echo "[info] 启动 Cloudflare Tunnel token 模式"
-        cloudflared tunnel --no-autoupdate run --token "${ARGO_TOKEN}" &
+        cloudflared tunnel --no-autoupdate --protocol http2 run --token "${ARGO_TOKEN}" &
     else
         printf '%s' "${ARGO_AUTH}" > "${CF_DIR}/credentials.json"
         local tunnel_id
@@ -118,7 +139,14 @@ start_tunnel() {
 tunnel: ${tunnel_id}
 credentials-file: ${CF_DIR}/credentials.json
 no-autoupdate: true
+protocol: http2
 ingress:
+  - hostname: ${ARGO_DOMAIN}
+    path: /proto.NezhaService/*
+    service: https://127.0.0.1:${GRPC_TLS_PORT}
+    originRequest:
+      http2Origin: true
+      noTLSVerify: true
   - hostname: ${ARGO_DOMAIN}
     service: http://127.0.0.1:${HTTP_PORT}
   - service: http_status:404

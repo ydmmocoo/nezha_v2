@@ -1,7 +1,15 @@
 :8080 {
     encode gzip
 
-    @grpc header Content-Type application/grpc*
-    reverse_proxy @grpc h2c://127.0.0.1:8008
     reverse_proxy 127.0.0.1:8008
+}
+
+:443 {
+    tls /opt/nezha/tls/grpc.pem /opt/nezha/tls/grpc.key
+    reverse_proxy {
+        to 127.0.0.1:8008
+        transport http {
+            versions h2c 2
+        }
+    }
 }
