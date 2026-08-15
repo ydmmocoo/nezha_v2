@@ -188,7 +188,7 @@ nezha-v2-20260814T040000Z.tar.gz
 
 ### 启动自动恢复
 
-参考项目采用 GitHub 备份仓库作为无持久化容器的数据源。本项目在启动阶段也会执行同样的恢复逻辑：仅当本地不存在 `data/sqlite.db` 时读取备份仓库，优先使用备份仓库 `README.md` 中记录的归档；如果 README 没有记录，则选择最新的 `nezha-v2-*.tar.gz`。恢复完成后才启动 Dashboard，避免先生成新的 `admin/admin` 数据库。
+参考项目采用 GitHub 备份仓库作为无持久化容器的数据源。本项目在启动阶段也会执行同样的恢复逻辑：仅当本地不存在 `data/sqlite.db` 时读取备份仓库，优先使用备份仓库 `README.md` 中记录的 `nezha-v2-*.tar.gz`；如果 README 没有记录，则选择最新的 `nezha-v2-*.tar.gz`。参考项目的 `dashboard-*.tar.gz` 可能包含 V0/V1 旧版 OAuth 配置，因此本项目不会自动恢复这类归档。恢复完成后才启动 Dashboard，避免先生成新的 `admin/admin` 数据库。
 
 因此，第一次部署必须先完成一次登录和配置，然后手动执行备份：
 
