@@ -242,6 +242,8 @@ curl -fsS http://127.0.0.1:8080/api/v1/setting
 
 ### GitHub 备份失败
 
+如果出现 `cp: recursion detected`，说明使用的是旧版备份脚本；最新版已将临时目录移到 `/opt/nezha/backup-work`，不会再把临时目录复制进 `data`。
+
 确认：
 
 1. `GH_REPO` 为 `owner/repository`，不是仓库网页 URL。

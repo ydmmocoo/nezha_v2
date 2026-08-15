@@ -4,7 +4,9 @@ set -Eeuo pipefail
 ROOT="${NEZHA_ROOT:-/opt/nezha}"
 DATA_DIR="${ROOT}/data"
 STATE_DIR="${DATA_DIR}/state"
-BACKUP_DIR="${STATE_DIR}/backup-work"
+# Keep the temporary payload outside DATA_DIR. Placing it below DATA_DIR and
+# then copying DATA_DIR into it causes recursive self-copy failures.
+BACKUP_DIR="${ROOT}/backup-work"
 RETENTION="${BACKUP_RETENTION:-7}"
 BRANCH="${GH_BRANCH:-main}"
 
