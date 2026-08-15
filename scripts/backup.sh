@@ -80,7 +80,8 @@ cp "${BACKUP_DIR}/${ARCHIVE}" "${BACKUP_DIR}/repo/${ARCHIVE}"
     echo "This repository is managed by the Nezha V2 Argo container. Keep it private."
 } > "${BACKUP_DIR}/repo/README.md"
 
-find "${BACKUP_DIR}/repo" -maxdepth 1 -type f -name 'nezha-v2-*.tar.gz' -printf '%f\n' \
+find "${BACKUP_DIR}/repo" -maxdepth 1 -type f -name 'nezha-v2-*.tar.gz' -print \
+    | sed 's#^.*/##' \
     | sort -r \
     | tail -n +$((RETENTION + 1)) \
     | while read -r old; do rm -f "${BACKUP_DIR}/repo/${old}"; done
