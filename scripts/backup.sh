@@ -52,8 +52,8 @@ if ! git -c "http.extraheader=AUTHORIZATION: Basic ${AUTH}" clone --quiet --dept
 fi
 
 rm -rf "${BACKUP_DIR}/payload"
-mkdir -p "${BACKUP_DIR}/payload"
-cp -a "${DATA_DIR}" "${BACKUP_DIR}/payload/data"
+mkdir -p "${BACKUP_DIR}/payload/data"
+cp -a "${DATA_DIR}/." "${BACKUP_DIR}/payload/data/"
 rm -rf "${BACKUP_DIR}/payload/data/state/backup-work" "${BACKUP_DIR}/payload/data/state/backup.lock" "${BACKUP_DIR}/payload/data/state/dashboard.pid"
 if [ -f "${DATA_DIR}/sqlite.db" ]; then
     rm -f "${BACKUP_DIR}/payload/data/sqlite.db"

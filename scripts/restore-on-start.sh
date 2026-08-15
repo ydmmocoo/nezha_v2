@@ -94,13 +94,24 @@ fi
 
 EXTRACT="${WORK}/extract"
 mkdir -p "${EXTRACT}"
-if ! tar -tzf "${ARCHIVE_FILE}" | grep -Eq '(^|/)data/sqlite\.db$'; then
+TAR_LIST="${WORK}/tar-list.txt"
+tar -tzf "${ARCHIVE_FILE}" | sed 's#^\./##' > "${TAR_LIST}" || {
+    warn "${ARCHIVE} cannot be read as a tar.gz archive; leaving a fresh data directory"
+    exit 0
+}
+
+DB_ENTRY="$(grep -E '(^|/)sqlite\.db$' "${TAR_LIST}" | head -n 1 || true)"
+if [ -z "${DB_ENTRY}" ]; then
     warn "${ARCHIVE} is not a valid Nezha V2 backup; leaving a fresh data directory"
     exit 0
 fi
 
 tar -xzf "${ARCHIVE_FILE}" -C "${EXTRACT}"
-SOURCE_DATA="${EXTRACT}/data"
+DATA_RELATIVE_DIR="${DB_ENTRY%/sqlite.db}"
+if [ "${DATA_RELATIVE_DIR}" = "${DB_ENTRY}" ]; then
+    DATA_RELATIVE_DIR="."
+fi
+SOURCE_DATA="${EXTRACT}/${DATA_RELATIVE_DIR}"
 if [ ! -s "${SOURCE_DATA}/sqlite.db" ]; then
     warn "${ARCHIVE} does not contain data/sqlite.db; leaving a fresh data directory"
     exit 0
